@@ -1,13 +1,18 @@
 import os
-import re
-import json
-import base64
-import asyncio
 import logging
+import base64
+import re
 
+from fastapi import FastAPI
 from openai import AsyncOpenAI
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    MenuButtonCommands,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,506 +22,858 @@ from telegram.ext import (
     filters,
 )
 
-
-# =========================
+# ============================================================
 # SETTINGS
-# =========================
+# ============================================================
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_KEY = os.environ["OPENAI_API_KEY"]
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
-
-openai = AsyncOpenAI(api_key=OPENAI_KEY)
-
-
-# =========================
-# LOGGING
-# =========================
+TEXT_MODEL = "gpt-5.6-luna"
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
 logger = logging.getLogger(__name__)
 
+app = FastAPI()
 
-# =========================
-# TEMPORARY USER DATA
-# =========================
+telegram_app = None
 
-users = {}
-
-
-# =========================
-# PRICE
-# =========================
-
-def get_price(text: str):
-
-    if not text:
-        return None
-
-    text = text.lower()
-
-    # 17 500
-    # 17.500
-    # 17,500
-    # 17500
-    match = re.search(
-        r"(?<!\d)(\d{1,3}(?:[\s.,]\d{3})+|\d{3,6})(?!\d)",
-        text,
+if TELEGRAM_TOKEN:
+    telegram_app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
     )
 
-    if not match:
-        return None
+openai_client = None
 
-    number = (
-        match.group(1)
-        .replace(" ", "")
-        .replace(".", "")
-        .replace(",", "")
+if OPENAI_API_KEY:
+    openai_client = AsyncOpenAI(
+        api_key=OPENAI_API_KEY
     )
 
-    try:
-        price = int(number)
 
-        if 100 <= price <= 999999:
-            return price
+# ============================================================
+# AI PROMPT
+# ============================================================
 
-    except ValueError:
-        pass
+SYSTEM_PROMPT = """
+Ты — Beauty Manager, персональный AI-помощник владельца
+Telegram-магазина «Косметика | Парфюм | Москва».
 
-    return None
+Магазин продаёт оригинальную косметику, парфюмерию
+и средства ухода.
 
+ТВОЯ ЗАДАЧА:
 
-# =========================
-# AI RECOGNITION
-# =========================
-
-async def recognize(image_bytes: bytes):
-
-    image64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    prompt = """
-Ты создаёшь карточки товаров для Telegram-магазина оригинальной
-косметики и парфюмерии.
-
-Посмотри на фотографию.
-
-Определи:
-1. Что это за товар.
-2. Бренд и название, если их можно определить.
-3. Подходящий русский хэштег категории.
-4. Сделай короткое красивое описание.
-
-Верни ТОЛЬКО JSON:
-
-{
-  "hashtag": "#парфюм",
-  "description": "✨ Бренд Название — короткое красивое описание товара."
-}
-
-Возможные хэштеги:
-
-#парфюм
-#тональный_крем
-#румяна
-#бронзер
-#пудра
-#тени
-#тушь
-#помада
-#блеск
-#крем
-#сыворотка
-#маска
-#шампунь
-#уход_за_лицом
-#уход_за_волосами
-#макияж
-#уход
-
-Если товар другой — придумай один короткий понятный хэштег.
+1. Определить товар по фотографии.
+2. Если возможно — определить:
+   - бренд;
+   - точное название;
+   - категорию;
+   - оттенок;
+   - объём/вес;
+   - другие данные, которые действительно видны.
+3. Если пользователь дал цену — использовать ИМЕННО её.
+4. Если пользователь дал количество — использовать ИМЕННО его.
+5. Найти актуальную информацию о товаре в интернете.
+6. В первую очередь ориентироваться на:
+   - официальный сайт бренда;
+   - официальные страницы продукта;
+   - крупные авторитетные магазины.
+7. Не выдумывать характеристики.
+8. Если разные сайты противоречат друг другу — сообщить об этом.
+9. Не выдавать догадки за факты.
+10. Не менять цену пользователя на найденную в интернете.
+11. Написать короткое красивое описание товара для Telegram-магазина.
+12. Не делать описание слишком длинным.
+13. Не использовать агрессивные продажи.
+14. Не использовать слишком много эмодзи.
 
 ВАЖНО:
 
-Не пиши:
-- объём;
-- оттенок;
-- наличие;
-- количество;
-- цену;
-- ссылки;
-- источники.
+Если товар точно не удалось определить,
+напиши, что идентификация требует уточнения.
 
-Только хэштег и описание.
+Если информации недостаточно,
+НЕ придумывай её.
 
-Если точное название невозможно определить, не выдумывай его.
+Формат готовой карточки:
+
+✨ БРЕНД — НАЗВАНИЕ
+
+Короткое описание в 2–4 предложениях.
+
+🤍 Объём/оттенок: ...
+💰 Цена: ...
+📦 В наличии: ...
+
+В конце:
+
+Источники:
+1. ...
+2. ...
+
+После карточки обязательно добавь:
+
+«Проверь, всё ли верно. После твоего одобрения можно подготовить публикацию.»
 """
 
-    response = await openai.responses.create(
-        model=MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt,
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{image64}",
-                    },
-                ],
-            }
-        ],
-        max_output_tokens=300,
-    )
 
-    result = response.output_text.strip()
+# ============================================================
+# KEYBOARDS
+# ============================================================
 
-    logger.info("AI: %s", result)
-
-    # Убираем markdown, если модель его добавила
-    result = result.replace("```json", "")
-    result = result.replace("```", "")
-    result = result.strip()
-
-    try:
-        data = json.loads(result)
-
-        hashtag = data.get("hashtag", "#товар")
-        description = data.get(
-            "description",
-            "✨ Товар из ассортимента."
-        )
-
-        if not hashtag.startswith("#"):
-            hashtag = "#" + hashtag
-
-        return hashtag, description
-
-    except Exception:
-
-        logger.exception("Ошибка JSON")
-
-        return (
-            "#товар",
-            "✨ Товар из нашего ассортимента."
-        )
-
-
-# =========================
-# CARD
-# =========================
-
-def make_caption(hashtag, description, price):
-
-    return (
-        f"{hashtag}\n\n"
-        f"{description}\n\n"
-        f"💰 {price:,} ₽"
-    )
-
-
-# =========================
-# BUTTONS
-# =========================
-
-def buttons():
-
-    return InlineKeyboardMarkup(
+def main_keyboard():
+    return InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton(
-                    "✅ Одобрить",
-                    callback_data="approve"
-                ),
-                InlineKeyboardButton(
-                    "❌ Удалить",
-                    callback_data="delete"
-                ),
-            ]
-        ]
+            InlineKeyboardButton(
+                "🆕 Новый товар",
+                callback_data="new_product"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✍️ Создать пост",
+                callback_data="post"
+            ),
+            InlineKeyboardButton(
+                "📱 Сторис",
+                callback_data="stories"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🎥 Reels/TikTok",
+                callback_data="reels"
+            ),
+            InlineKeyboardButton(
+                "📅 План",
+                callback_data="plan"
+            ),
+        ],
+    ])
+
+
+def product_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Одобрить",
+                callback_data="approve_product"
+            ),
+            InlineKeyboardButton(
+                "✏️ Изменить",
+                callback_data="edit_product"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🖼️ Другое фото",
+                callback_data="another_photo"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔄 Новый товар",
+                callback_data="new_product"
+            ),
+        ],
+    ])
+
+
+def approval_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Одобрить",
+                callback_data="approve_product"
+            ),
+            InlineKeyboardButton(
+                "✏️ Изменить",
+                callback_data="edit_product"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔄 Новый товар",
+                callback_data="new_product"
+            ),
+        ],
+    ])
+
+
+# ============================================================
+# MENU
+# ============================================================
+
+async def configure_bot_menu():
+
+    if not telegram_app:
+        return
+
+    commands = [
+        BotCommand(
+            "start",
+            "Главное меню"
+        ),
+        BotCommand(
+            "new",
+            "Новый товар"
+        ),
+        BotCommand(
+            "post",
+            "Создать пост"
+        ),
+        BotCommand(
+            "stories",
+            "Создать сторис"
+        ),
+        BotCommand(
+            "reels",
+            "Идеи Reels/TikTok"
+        ),
+        BotCommand(
+            "plan",
+            "План на неделю"
+        ),
+    ]
+
+    await telegram_app.bot.set_my_commands(commands)
+
+    await telegram_app.bot.set_chat_menu_button(
+        menu_button=MenuButtonCommands()
     )
 
 
-# =========================
+# ============================================================
 # START
-# =========================
+# ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    context.user_data.clear()
+
     await update.message.reply_text(
-        "Привет! 🩷\n\n"
-        "Отправь фотографию товара.\n"
-        "Цена может быть:\n"
-        "• в подписи к фото\n"
-        "• следующим сообщением\n\n"
-        "Например: 17500 ₽"
+        "Привет! 💗\n\n"
+        "Я Beauty Manager — твой AI-помощник "
+        "для «Косметика | Парфюм | Москва».\n\n"
+        "Теперь можешь просто отправить мне:\n\n"
+        "📸 фотографию товара\n"
+        "💰 цену\n"
+        "📦 количество\n\n"
+        "А дальше я сама разберусь с товаром, "
+        "найду информацию и подготовлю красивую карточку.\n\n"
+        "И главное — ничего не публикую без твоего одобрения.",
+        reply_markup=main_keyboard(),
     )
 
 
-# =========================
-# PHOTO
-# =========================
+# ============================================================
+# NEW PRODUCT
+# ============================================================
 
-async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def new_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "🆕 Начинаем новый товар.\n\n"
+        "Пришли фотографию товара.\n\n"
+        "Лучше сразу написать вместе с фото:\n"
+        "💰 цену\n"
+        "📦 количество\n\n"
+        "Например:\n"
+        "«3500 ₽, в наличии 2 шт.»"
+    )
+
+
+# ============================================================
+# COMMANDS
+# ============================================================
+
+async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["mode"] = "post"
+
+    await update.message.reply_text(
+        "✍️ Хорошо.\n\n"
+        "Пришли товар или напиши тему поста."
+    )
+
+
+async def stories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["mode"] = "stories"
+
+    await update.message.reply_text(
+        "📱 Пришли товар или тему.\n\n"
+        "Я подготовлю серию сторис."
+    )
+
+
+async def reels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["mode"] = "reels"
+
+    await update.message.reply_text(
+        "🎥 Напиши товар или тему.\n\n"
+        "Придумаю идеи Reels/TikTok."
+    )
+
+
+async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data["mode"] = "plan"
+
+    await update.message.reply_text(
+        "📅 Пришли список товаров "
+        "или напиши, что сейчас нужно продвигать."
+    )
+
+
+# ============================================================
+# AI — TEXT
+# ============================================================
+
+async def ask_ai(
+    text: str,
+    image_bytes: bytes | None = None,
+    web_search: bool = False,
+) -> str:
+
+    if not openai_client:
+        return (
+            "⚠️ OpenAI пока не подключён.\n\n"
+            "Проверь OPENAI_API_KEY в Render."
+        )
+
+    content = []
+
+    content.append({
+        "type": "input_text",
+        "text": text,
+    })
+
+    if image_bytes:
+
+        encoded = base64.b64encode(
+            image_bytes
+        ).decode("utf-8")
+
+        image_data_url = (
+            "data:image/jpeg;base64,"
+            + encoded
+        )
+
+        content.append({
+            "type": "input_image",
+            "image_url": image_data_url,
+        })
+
+    tools = []
+
+    if web_search:
+        tools.append({
+            "type": "web_search"
+        })
 
     try:
 
-        user_id = update.effective_user.id
-        message = update.message
+        response = await openai_client.responses.create(
 
-        logger.info("PHOTO from %s", user_id)
+            model=TEXT_MODEL,
 
-        telegram_photo = message.photo[-1]
+            instructions=SYSTEM_PROMPT,
 
-        file = await context.bot.get_file(
-            telegram_photo.file_id
+            tools=tools,
+
+            input=[
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
         )
 
-        image = await file.download_as_bytearray()
-
-        image = bytes(image)
-
-        price = get_price(
-            message.caption or ""
-        )
-
-        users[user_id] = {
-            "image": image,
-            "price": price,
-        }
-
-        # Цена уже есть
-        if price:
-
-            await message.reply_text(
-                "🔎 Распознаю товар..."
-            )
-
-            await create_product(
-                update,
-                context,
-                user_id,
-            )
-
-        # Цены нет
-        else:
-
-            await message.reply_text(
-                "📸 Фото получила!\n\n"
-                "Теперь отправь цену.\n"
-                "Например: 17500 ₽"
-            )
-
-    except Exception as e:
-
-        logger.exception("PHOTO ERROR")
-
-        await update.message.reply_text(
-            "❌ Ошибка при получении фотографии."
-        )
-
-
-# =========================
-# TEXT
-# =========================
-
-async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user_id = update.effective_user.id
-    message = update.message
-
-    text_value = message.text or ""
-
-    logger.info(
-        "TEXT from %s: %s",
-        user_id,
-        text_value,
-    )
-
-    # Есть фотография, ждём цену
-    if user_id in users:
-
-        price = get_price(text_value)
-
-        if price:
-
-            users[user_id]["price"] = price
-
-            await message.reply_text(
-                "💰 Цена получила!\n"
-                "🔎 Распознаю товар..."
-            )
-
-            await create_product(
-                update,
-                context,
-                user_id,
-            )
-
-            return
-
-    await message.reply_text(
-        "Отправь сначала фотографию товара 📸"
-    )
-
-
-# =========================
-# CREATE PRODUCT
-# =========================
-
-async def create_product(
-    update,
-    context,
-    user_id,
-):
-
-    data = users.get(user_id)
-
-    if not data:
-        return
-
-    image = data["image"]
-    price = data["price"]
-
-    if not price:
-        return
-
-    try:
-
-        hashtag, description = await recognize(
-            image
-        )
-
-        caption = make_caption(
-            hashtag,
-            description,
-            price,
-        )
-
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=image,
-            caption=caption,
-            reply_markup=buttons(),
-        )
-
-        logger.info(
-            "PRODUCT CREATED: %s",
-            caption,
-        )
-
-        users.pop(user_id, None)
+        return response.output_text
 
     except Exception as e:
 
         logger.exception(
-            "CREATE PRODUCT ERROR"
+            "OpenAI request failed"
         )
 
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                "❌ Не удалось создать карточку.\n\n"
-                f"{str(e)[:400]}"
-            ),
+        return (
+            "Не получилось обработать запрос 😔\n\n"
+            "Техническая ошибка.\n"
+            "Проверь логи Render."
         )
 
 
-# =========================
-# BUTTONS
-# =========================
+# ============================================================
+# PHOTO
+# ============================================================
 
-async def callback(
+async def photo_message(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    telegram_photo = update.message.photo[-1]
+
+    file = await telegram_photo.get_file()
+
+    image_bytes = bytes(
+        await file.download_as_bytearray()
+    )
+
+    caption = (
+        update.message.caption
+        or ""
+    )
+
+    # сохраняем фото
+    context.user_data[
+        "product_image"
+    ] = image_bytes
+
+    context.user_data[
+        "product_caption"
+    ] = caption
+
+    context.user_data[
+        "mode"
+    ] = "product"
+
+    await update.message.chat.send_action(
+        "typing"
+    )
+
+    await update.message.reply_text(
+        "🔎 Рассматриваю товар и ищу информацию о нём...\n\n"
+        "Это может занять немного времени."
+    )
+
+    user_request = f"""
+Пользователь прислал фотографию товара.
+
+Дополнительная информация от пользователя:
+{caption if caption else "Не указана"}
+
+Сделай следующее:
+
+1. Определи товар по фотографии.
+2. Найди точное название и бренд.
+3. Найди подтверждённую информацию о товаре в интернете.
+4. Проверь информацию минимум по нескольким источникам,
+   если это возможно.
+5. Приоритет — официальный сайт бренда.
+6. Подготовь короткое описание для магазина.
+7. Если пользователь указал цену — используй её.
+8. Если указал количество — используй его.
+9. Не придумывай отсутствующие данные.
+
+Верни готовую карточку товара.
+"""
+
+    answer = await ask_ai(
+        user_request,
+        image_bytes=image_bytes,
+        web_search=True,
+    )
+
+    await update.message.reply_text(
+        answer,
+        reply_markup=product_keyboard(),
+    )
+
+
+# ============================================================
+# TEXT MESSAGE
+# ============================================================
+
+async def text_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = update.message.text or ""
+
+    mode = context.user_data.get(
+        "mode"
+    )
+
+    if mode == "product":
+
+        image_bytes = context.user_data.get(
+            "product_image"
+        )
+
+        answer = await ask_ai(
+            text,
+            image_bytes=image_bytes,
+            web_search=True,
+        )
+
+    else:
+
+        mode_prompt = ""
+
+        if mode == "post":
+            mode_prompt = """
+Сделай готовый продающий пост
+для Telegram-магазина косметики.
+"""
+
+        elif mode == "stories":
+            mode_prompt = """
+Сделай серию коротких сторис.
+Каждая сторис должна быть отдельным экраном.
+"""
+
+        elif mode == "reels":
+            mode_prompt = """
+Предложи конкретные идеи Reels/TikTok.
+Для каждой дай:
+сюжет, первую фразу, текст на экране
+и CTA.
+"""
+
+        elif mode == "plan":
+            mode_prompt = """
+Составь реалистичный контент-план
+для Telegram-магазина на 7 дней.
+"""
+
+        else:
+            mode_prompt = """
+Ответь как личный AI-помощник
+владельца магазина косметики.
+"""
+
+        answer = await ask_ai(
+            mode_prompt + "\n\n" + text,
+            web_search=False,
+        )
+
+    context.user_data["mode"] = None
+
+    await update.message.reply_text(
+        answer,
+        reply_markup=main_keyboard(),
+    )
+
+
+# ============================================================
+# BUTTONS
+# ============================================================
+
+async def button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     query = update.callback_query
 
     await query.answer()
 
-    if query.data == "approve":
+    data = query.data
+
+    # --------------------------------------------
+    # NEW PRODUCT
+    # --------------------------------------------
+
+    if data == "new_product":
+
+        context.user_data.clear()
 
         await query.message.reply_text(
-            "✅ Товар одобрен."
+            "🔄 Начинаем новый товар.\n\n"
+            "Пришли фото + цену + количество."
         )
 
-    elif query.data == "delete":
+        return
 
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+    # --------------------------------------------
+    # APPROVE
+    # --------------------------------------------
+
+    if data == "approve_product":
+
+        context.user_data[
+            "approved"
+        ] = True
+
+        await query.message.reply_text(
+            "✅ Товар одобрен!\n\n"
+            "Карточка сохранена.\n\n"
+            "Следующий этап — подключим "
+            "подготовку финального рекламного изображения "
+            "и публикацию в канал.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔄 Новый товар",
+                        callback_data="new_product"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏠 Главное меню",
+                        callback_data="home"
+                    )
+                ],
+            ]),
+        )
+
+        return
+
+    # --------------------------------------------
+    # EDIT
+    # --------------------------------------------
+
+    if data == "edit_product":
+
+        context.user_data[
+            "mode"
+        ] = "edit_product"
+
+        await query.message.reply_text(
+            "✏️ Напиши, что именно изменить.\n\n"
+            "Например:\n"
+            "«Сделай описание короче»\n"
+            "«Убери эмодзи»\n"
+            "«Добавь, что оттенок 02 Auburn»\n"
+            "«Измени цену на 3900 ₽»"
+        )
+
+        return
+
+    # --------------------------------------------
+    # ANOTHER PHOTO
+    # --------------------------------------------
+
+    if data == "another_photo":
+
+        context.user_data.pop(
+            "product_image",
+            None
+        )
+
+        await query.message.reply_text(
+            "🖼️ Хорошо.\n\n"
+            "Пришли новое фото этого товара."
+        )
+
+        return
+
+    # --------------------------------------------
+    # POST
+    # --------------------------------------------
+
+    if data == "post":
+
+        context.user_data[
+            "mode"
+        ] = "post"
+
+        await query.message.reply_text(
+            "✍️ Напиши, о каком товаре "
+            "или теме сделать пост."
+        )
+
+        return
+
+    # --------------------------------------------
+    # STORIES
+    # --------------------------------------------
+
+    if data == "stories":
+
+        context.user_data[
+            "mode"
+        ] = "stories"
+
+        await query.message.reply_text(
+            "📱 Напиши товар или тему "
+            "для серии сторис."
+        )
+
+        return
+
+    # --------------------------------------------
+    # REELS
+    # --------------------------------------------
+
+    if data == "reels":
+
+        context.user_data[
+            "mode"
+        ] = "reels"
+
+        await query.message.reply_text(
+            "🎥 Напиши товар или тему "
+            "для Reels/TikTok."
+        )
+
+        return
+
+    # --------------------------------------------
+    # PLAN
+    # --------------------------------------------
+
+    if data == "plan":
+
+        context.user_data[
+            "mode"
+        ] = "plan"
+
+        await query.message.reply_text(
+            "📅 Пришли список товаров "
+            "или напиши, что сейчас нужно продвигать."
+        )
+
+        return
+
+    # --------------------------------------------
+    # HOME
+    # --------------------------------------------
+
+    if data == "home":
+
+        context.user_data.clear()
+
+        await query.message.reply_text(
+            "🏠 Главное меню",
+            reply_markup=main_keyboard(),
+        )
+
+        return
 
 
-# =========================
-# ERROR
-# =========================
+# ============================================================
+# SETUP
+# ============================================================
 
-async def error(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def setup():
 
-    logger.exception(
-        "BOT ERROR",
-        exc_info=context.error,
+    if not telegram_app:
+
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not set"
+        )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
-
-# =========================
-# MAIN
-# =========================
-
-def main():
-
-    logger.info("STARTING BOT")
-    logger.info("MODEL: %s", MODEL)
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
+    telegram_app.add_handler(
+        CommandHandler(
+            "new",
+            new_product
+        )
     )
 
-    app.add_handler(
-        CommandHandler("start", start)
+    telegram_app.add_handler(
+        CommandHandler(
+            "post",
+            post_command
+        )
     )
 
-    app.add_handler(
+    telegram_app.add_handler(
+        CommandHandler(
+            "stories",
+            stories_command
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "reels",
+            reels_command
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "plan",
+            plan_command
+        )
+    )
+
+    telegram_app.add_handler(
+        CallbackQueryHandler(
+            button
+        )
+    )
+
+    telegram_app.add_handler(
         MessageHandler(
             filters.PHOTO,
-            photo,
+            photo_message
         )
     )
 
-    app.add_handler(
+    telegram_app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text,
+            filters.TEXT
+            & ~filters.COMMAND,
+            text_message
         )
     )
 
-    app.add_handler(
-        CallbackQueryHandler(callback)
-    )
+    await telegram_app.initialize()
 
-    app.add_error_handler(error)
+    await telegram_app.start()
 
-    logger.info("BOT IS RUNNING")
-
-    app.run_polling(
-        drop_pending_updates=False,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    await configure_bot_menu()
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# FASTAPI
+# ============================================================
+
+@app.on_event("startup")
+async def startup():
+
+    await setup()
+
+    await telegram_app.updater.start_polling()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+
+    if telegram_app:
+
+        await telegram_app.updater.stop()
+
+        await telegram_app.stop()
+
+        await telegram_app.shutdown()
+
+
+@app.get("/")
+async def root():
+
+    return {
+        "status": "ok",
+        "service": "beauty-manager-bot",
+    }
+
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "healthy"
+}
