@@ -4,15 +4,10 @@ import json
 import base64
 import asyncio
 import logging
-from typing import Optional
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,92 +18,70 @@ from telegram.ext import (
 )
 
 
-# =========================================================
-# НАСТРОЙКИ
-# =========================================================
+# =========================
+# SETTINGS
+# =========================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+OPENAI_KEY = os.environ["OPENAI_API_KEY"]
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN")
-
-if not OPENAI_API_KEY:
-    raise RuntimeError("Не найден OPENAI_API_KEY")
+openai = AsyncOpenAI(api_key=OPENAI_KEY)
 
 
-# OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-# =========================================================
-# ЛОГИ
-# =========================================================
+# =========================
+# LOGGING
+# =========================
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 logger = logging.getLogger(__name__)
 
 
-# =========================================================
-# ВРЕМЕННОЕ ХРАНИЛИЩЕ
-# =========================================================
+# =========================
+# TEMPORARY USER DATA
+# =========================
 
-# Для каждого пользователя запоминаем последнюю фотографию,
-# чтобы можно было написать цену следующим сообщением.
-pending_products = {}
+users = {}
 
 
-# =========================================================
-# ЦЕНА
-# =========================================================
+# =========================
+# PRICE
+# =========================
 
-def extract_price(text: str) -> Optional[int]:
-    """
-    Понимает:
-    17500
-    17 500
-    17.500
-    17,500
-    17500 ₽
-    цена 17500
-    цена: 17500
-    """
+def get_price(text: str):
 
     if not text:
         return None
 
-    text = text.lower().strip()
+    text = text.lower()
 
-    # Убираем слово "цена"
-    text = re.sub(r"цена\s*[:\-]?\s*", "", text)
-
-    # Ищем число от 3 до 6 цифр с возможными пробелами/точками/запятыми
+    # 17 500
+    # 17.500
+    # 17,500
+    # 17500
     match = re.search(
         r"(?<!\d)(\d{1,3}(?:[\s.,]\d{3})+|\d{3,6})(?!\d)",
-        text
+        text,
     )
 
     if not match:
         return None
 
-    value = match.group(1)
-
-    # Убираем разделители тысяч
-    value = value.replace(" ", "")
-    value = value.replace(".", "")
-    value = value.replace(",", "")
+    number = (
+        match.group(1)
+        .replace(" ", "")
+        .replace(".", "")
+        .replace(",", "")
+    )
 
     try:
-        price = int(value)
+        price = int(number)
 
-        # Защита от случайного распознавания чего-то вроде года
         if 100 <= price <= 999999:
             return price
 
@@ -118,83 +91,73 @@ def extract_price(text: str) -> Optional[int]:
     return None
 
 
-# =========================================================
-# РАСПОЗНАВАНИЕ ТОВАРА
-# =========================================================
+# =========================
+# AI RECOGNITION
+# =========================
 
-def recognize_product(image_bytes: bytes) -> dict:
-    """
-    Отправляем фотографию в OpenAI.
-    Просим вернуть только:
-    - категорию
-    - название
-    - короткое описание
-    """
+async def recognize(image_bytes: bytes):
 
-    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    image_url = f"data:image/jpeg;base64,{image_base64}"
+    image64 = base64.b64encode(image_bytes).decode("utf-8")
 
     prompt = """
-Ты помогаешь владельцу Telegram-магазина косметики и парфюмерии.
+Ты создаёшь карточки товаров для Telegram-магазина оригинальной
+косметики и парфюмерии.
 
-Посмотри на фотографию товара и определи, что это за товар.
+Посмотри на фотографию.
 
-Нужно вернуть ТОЛЬКО JSON:
+Определи:
+1. Что это за товар.
+2. Бренд и название, если их можно определить.
+3. Подходящий русский хэштег категории.
+4. Сделай короткое красивое описание.
+
+Верни ТОЛЬКО JSON:
 
 {
   "hashtag": "#парфюм",
-  "description": "✨ Бренд + название товара — короткое красивое описание товара в 1 предложении."
+  "description": "✨ Бренд Название — короткое красивое описание товара."
 }
 
-Правила:
+Возможные хэштеги:
 
-1. hashtag должен быть ОДНИМ подходящим хэштегом.
+#парфюм
+#тональный_крем
+#румяна
+#бронзер
+#пудра
+#тени
+#тушь
+#помада
+#блеск
+#крем
+#сыворотка
+#маска
+#шампунь
+#уход_за_лицом
+#уход_за_волосами
+#макияж
+#уход
 
-Примеры:
-парфюм → #парфюм
-духи → #парфюм
-тональный крем → #тональный_крем
-румяна → #румяна
-бронзер → #бронзер
-пудра → #пудра
-тени → #тени
-тушь → #тушь
-помада → #помада
-блеск для губ → #блеск
-крем → #крем
-сыворотка → #сыворотка
-шампунь → #шампунь
-маска → #маска
-уход за волосами → #уход_за_волосами
-уход за лицом → #уход_за_лицом
+Если товар другой — придумай один короткий понятный хэштег.
 
-Если категория другая, создай понятный короткий русский хэштег.
+ВАЖНО:
 
-2. В description обязательно постарайся указать БРЕНД и НАЗВАНИЕ товара,
-если их можно определить по фотографии.
-
-3. Сделай описание коротким и привлекательным.
-Пример:
-"✨ HFC Devil's Intrigue — насыщенный и соблазнительный аромат с выразительным характером."
-
-4. НЕ указывай:
+Не пиши:
 - объём;
 - оттенок;
+- наличие;
 - количество;
 - цену;
-- наличие;
 - ссылки;
-- источники;
-- артикулы.
+- источники.
 
-5. Не выдумывай конкретные характеристики, которых не видно или в которых не уверен.
+Только хэштег и описание.
 
-6. Ответ должен быть только JSON без Markdown.
+Если точное название невозможно определить, не выдумывай его.
 """
 
-    response = client.responses.create(
-        model=OPENAI_MODEL,
+    response = await openai.responses.create(
+        model=MODEL,
         input=[
             {
                 "role": "user",
@@ -205,8 +168,7 @@ def recognize_product(image_bytes: bytes) -> dict:
                     },
                     {
                         "type": "input_image",
-                        "image_url": image_url,
-                        "detail": "high",
+                        "image_url": f"data:image/jpeg;base64,{image64}",
                     },
                 ],
             }
@@ -214,295 +176,266 @@ def recognize_product(image_bytes: bytes) -> dict:
         max_output_tokens=300,
     )
 
-    raw = response.output_text.strip()
+    result = response.output_text.strip()
 
-    logger.info("Ответ OpenAI: %s", raw)
+    logger.info("AI: %s", result)
 
-    # Иногда модель может добавить ```json
-    raw = raw.replace("```json", "")
-    raw = raw.replace("```", "")
-    raw = raw.strip()
+    # Убираем markdown, если модель его добавила
+    result = result.replace("```json", "")
+    result = result.replace("```", "")
+    result = result.strip()
 
     try:
-        data = json.loads(raw)
-    except Exception:
-        logger.exception("Не удалось распарсить JSON OpenAI")
+        data = json.loads(result)
 
-        return {
-            "hashtag": "#товар",
-            "description": "✨ Товар из представленного ассортимента.",
-        }
-
-    hashtag = str(data.get("hashtag", "#товар")).strip()
-    description = str(
-        data.get(
+        hashtag = data.get("hashtag", "#товар")
+        description = data.get(
             "description",
-            "✨ Товар из представленного ассортимента."
+            "✨ Товар из ассортимента."
         )
-    ).strip()
 
-    if not hashtag.startswith("#"):
-        hashtag = "#" + hashtag
+        if not hashtag.startswith("#"):
+            hashtag = "#" + hashtag
 
-    return {
-        "hashtag": hashtag,
-        "description": description,
-    }
+        return hashtag, description
+
+    except Exception:
+
+        logger.exception("Ошибка JSON")
+
+        return (
+            "#товар",
+            "✨ Товар из нашего ассортимента."
+        )
 
 
-# =========================================================
-# СОЗДАНИЕ КАРТОЧКИ
-# =========================================================
+# =========================
+# CARD
+# =========================
 
-def build_caption(product: dict, price: int) -> str:
+def make_caption(hashtag, description, price):
 
-    hashtag = product["hashtag"]
-    description = product["description"]
-
-    caption = (
+    return (
         f"{hashtag}\n\n"
-        f"{description}\n"
+        f"{description}\n\n"
         f"💰 {price:,} ₽"
     )
 
-    # Telegram caption ограничен, поэтому дополнительно страхуемся
-    if len(caption) > 1000:
-        caption = caption[:997] + "..."
 
-    return caption
+# =========================
+# BUTTONS
+# =========================
 
+def buttons():
 
-# =========================================================
-# КНОПКИ
-# =========================================================
-
-def approval_keyboard() -> InlineKeyboardMarkup:
-
-    keyboard = [
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "✅ Одобрить",
-                callback_data="approve"
-            ),
-            InlineKeyboardButton(
-                "❌ Удалить",
-                callback_data="delete"
-            ),
+            [
+                InlineKeyboardButton(
+                    "✅ Одобрить",
+                    callback_data="approve"
+                ),
+                InlineKeyboardButton(
+                    "❌ Удалить",
+                    callback_data="delete"
+                ),
+            ]
         ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+    )
 
 
-# =========================================================
-# /START
-# =========================================================
+# =========================
+# START
+# =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Привет! 🩷\n\n"
-        "Отправь мне фотографию товара.\n\n"
-        "Можно сразу написать цену в подписи к фотографии:\n"
-        "например: 17500 ₽\n\n"
-        "Если цены нет — просто отправь её следующим сообщением."
+        "Отправь фотографию товара.\n"
+        "Цена может быть:\n"
+        "• в подписи к фото\n"
+        "• следующим сообщением\n\n"
+        "Например: 17500 ₽"
     )
 
 
-# =========================================================
-# ФОТО
-# =========================================================
+# =========================
+# PHOTO
+# =========================
 
-async def photo_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.message
-    user_id = update.effective_user.id
-
-    logger.info(
-        "Получена фотография от пользователя %s",
-        user_id
-    )
+async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
 
-        # Берём самое большое доступное фото
-        photo = message.photo[-1]
+        user_id = update.effective_user.id
+        message = update.message
 
-        telegram_file = await context.bot.get_file(photo.file_id)
+        logger.info("PHOTO from %s", user_id)
 
-        image_bytes = await telegram_file.download_as_bytearray()
+        telegram_photo = message.photo[-1]
 
-        # Проверяем цену в подписи
-        caption = message.caption or ""
-        price = extract_price(caption)
-
-        logger.info(
-            "Цена из подписи: %s",
-            price
+        file = await context.bot.get_file(
+            telegram_photo.file_id
         )
 
-        # Сохраняем фото
-        pending_products[user_id] = {
-            "image_bytes": bytes(image_bytes),
+        image = await file.download_as_bytearray()
+
+        image = bytes(image)
+
+        price = get_price(
+            message.caption or ""
+        )
+
+        users[user_id] = {
+            "image": image,
             "price": price,
         }
 
-        # Если цена уже есть — сразу обрабатываем
+        # Цена уже есть
         if price:
 
             await message.reply_text(
                 "🔎 Распознаю товар..."
             )
 
-            await process_product(
+            await create_product(
                 update,
                 context,
-                user_id
+                user_id,
             )
 
+        # Цены нет
         else:
 
             await message.reply_text(
                 "📸 Фото получила!\n\n"
-                "Теперь отправь цену, например:\n"
-                "17500 ₽"
+                "Теперь отправь цену.\n"
+                "Например: 17500 ₽"
             )
 
     except Exception as e:
 
-        logger.exception("Ошибка при обработке фотографии")
+        logger.exception("PHOTO ERROR")
 
-        await message.reply_text(
-            "❌ Не удалось обработать фотографию.\n\n"
-            f"Ошибка: {str(e)[:300]}"
+        await update.message.reply_text(
+            "❌ Ошибка при получении фотографии."
         )
 
 
-# =========================================================
-# ТЕКСТ
-# =========================================================
+# =========================
+# TEXT
+# =========================
 
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    message = update.message
     user_id = update.effective_user.id
+    message = update.message
 
-    text = (message.text or "").strip()
+    text_value = message.text or ""
 
     logger.info(
-        "Получено текстовое сообщение от %s: %s",
+        "TEXT from %s: %s",
         user_id,
-        text
+        text_value,
     )
 
-    # Если есть ожидающее фото
-    if user_id in pending_products:
+    # Есть фотография, ждём цену
+    if user_id in users:
 
-        price = extract_price(text)
+        price = get_price(text_value)
 
         if price:
 
-            pending_products[user_id]["price"] = price
+            users[user_id]["price"] = price
 
             await message.reply_text(
                 "💰 Цена получила!\n"
-                "🔎 Определяю товар..."
+                "🔎 Распознаю товар..."
             )
 
-            await process_product(
+            await create_product(
                 update,
                 context,
-                user_id
+                user_id,
             )
 
             return
 
-    # Если это не цена
     await message.reply_text(
-        "Я жду фотографию товара 📸\n\n"
-        "Отправь фото, а затем цену."
+        "Отправь сначала фотографию товара 📸"
     )
 
 
-# =========================================================
-# ОБРАБОТКА ТОВАРА
-# =========================================================
+# =========================
+# CREATE PRODUCT
+# =========================
 
-async def process_product(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int
+async def create_product(
+    update,
+    context,
+    user_id,
 ):
 
-    product_data = pending_products.get(user_id)
+    data = users.get(user_id)
 
-    if not product_data:
+    if not data:
         return
 
-    price = product_data.get("price")
-    image_bytes = product_data.get("image_bytes")
+    image = data["image"]
+    price = data["price"]
 
-    if not price or not image_bytes:
+    if not price:
         return
 
     try:
 
-        # OpenAI синхронный клиент запускаем отдельно,
-        # чтобы не блокировать Telegram
-        product = await asyncio.to_thread(
-            recognize_product,
-            image_bytes
+        hashtag, description = await recognize(
+            image
         )
 
-        caption = build_caption(
-            product,
-            price
+        caption = make_caption(
+            hashtag,
+            description,
+            price,
         )
 
-        # Отправляем карточку
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
-            photo=image_bytes,
+            photo=image,
             caption=caption,
-            reply_markup=approval_keyboard(),
+            reply_markup=buttons(),
         )
 
         logger.info(
-            "Карточка успешно создана: %s",
-            caption
+            "PRODUCT CREATED: %s",
+            caption,
         )
 
-        # Удаляем временные данные
-        pending_products.pop(user_id, None)
+        users.pop(user_id, None)
 
     except Exception as e:
 
         logger.exception(
-            "Ошибка распознавания товара"
+            "CREATE PRODUCT ERROR"
         )
 
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=(
-                "❌ Не получилось распознать товар.\n\n"
-                f"Ошибка: {str(e)[:500]}"
-            )
+                "❌ Не удалось создать карточку.\n\n"
+                f"{str(e)[:400]}"
+            ),
         )
 
 
-# =========================================================
-# КНОПКИ
-# =========================================================
+# =========================
+# BUTTONS
+# =========================
 
-async def button_handler(
+async def callback(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
@@ -512,7 +445,7 @@ async def button_handler(
     if query.data == "approve":
 
         await query.message.reply_text(
-            "✅ Товар одобрен!"
+            "✅ Товар одобрен."
         )
 
     elif query.data == "delete":
@@ -523,73 +456,65 @@ async def button_handler(
             pass
 
 
-# =========================================================
-# ОШИБКИ
-# =========================================================
+# =========================
+# ERROR
+# =========================
 
-async def error_handler(
+async def error(
     update: object,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     logger.exception(
-        "Глобальная ошибка Telegram:",
-        exc_info=context.error
+        "BOT ERROR",
+        exc_info=context.error,
     )
 
 
-# =========================================================
-# ЗАПУСК
-# =========================================================
+# =========================
+# MAIN
+# =========================
 
 def main():
 
-    logger.info("===================================")
-    logger.info("Запуск Beauty Manager Bot")
-    logger.info("OpenAI model: %s", OPENAI_MODEL)
-    logger.info("===================================")
+    logger.info("STARTING BOT")
+    logger.info("MODEL: %s", MODEL)
 
-    application = (
+    app = (
         Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
+        .token(BOT_TOKEN)
         .build()
     )
 
-    # /start
-    application.add_handler(
+    app.add_handler(
         CommandHandler("start", start)
     )
 
-    # Фотографии
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.PHOTO,
-            photo_handler
+            photo,
         )
     )
 
-    # Текстовые сообщения
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            text_handler
+            text,
         )
     )
 
-    # Кнопки
-    application.add_handler(
-        CallbackQueryHandler(button_handler)
+    app.add_handler(
+        CallbackQueryHandler(callback)
     )
 
-    # Глобальные ошибки
-    application.add_error_handler(
-        error_handler
-    )
+    app.add_error_handler(error)
 
-    logger.info("Бот запущен. Ожидаю сообщения...")
+    logger.info("BOT IS RUNNING")
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    app.run_polling(
+        drop_pending_updates=False,
+        allowed_updates=Update.ALL_TYPES,
     )
 
 
