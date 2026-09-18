@@ -1,13 +1,13 @@
 import os
 import re
 import json
+import base64
 import asyncio
 import sqlite3
 import logging
-import html
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin, urlparse
+from typing import Optional
 
 import httpx
 from bs4 import BeautifulSoup
@@ -18,8 +18,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
     InputMediaPhoto,
 )
 from telegram.ext import (
@@ -36,750 +34,1066 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# Можно оставить пустым.
-# Канал можно подключить прямо из бота через кнопку.
-ENV_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow")
 
-# Москва — основной часовой пояс магазина.
-DEFAULT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow")
+# Если ID канала указан в Render — бот использует его.
+# Можно оставить пустым и подключить канал через /channel.
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
 
 DB_PATH = os.getenv("DB_PATH", "beauty_manager.db")
 
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
-
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is missing")
-
+MAX_CAPTION_LENGTH = 1000
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
 
-logger = logging.getLogger("beauty-manager")
+logger = logging.getLogger("beauty_manager")
 
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set")
+
+
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI()
+
+telegram_app: Optional[Application] = None
+
+# Состояние текущего диалога.
+USER_STATE = {}
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.row_factory = sqlite3.Row
-
-
-def db_execute(query, params=(), commit=True):
-    cur = db.cursor()
-    cur.execute(query, params)
-    if commit:
-        db.commit()
-    return cur
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
-    db_execute("""
+    conn = db()
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             channel_id TEXT,
             timezone TEXT DEFAULT 'Europe/Moscow',
-            schedule_enabled INTEGER DEFAULT 0,
-            schedule_days TEXT DEFAULT '[0,1,2,3,4,5,6]',
-            schedule_times TEXT DEFAULT '["10:00","15:00","20:00"]'
+            schedule_enabled INTEGER DEFAULT 1,
+            created_at TEXT
         )
     """)
 
-    db_execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            status TEXT DEFAULT 'queued',
-            scheduled_at TEXT NOT NULL,
-            caption TEXT,
-            text_content TEXT,
+            channel_id TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            text TEXT,
             photo1 TEXT,
             photo2 TEXT,
-            created_at TEXT NOT NULL,
-            published_at TEXT
+            publish_at TEXT,
+            status TEXT DEFAULT 'waiting',
+            created_at TEXT
         )
     """)
 
-    db_execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            name TEXT,
             category TEXT,
             item_type TEXT,
-            name TEXT,
-            description TEXT,
-            volume TEXT,
-            shade TEXT,
             price TEXT,
             stock TEXT,
+            data_json TEXT,
             photo1 TEXT,
             photo2 TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT
         )
     """)
 
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS drafts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            content TEXT,
-            photo1 TEXT,
-            photo2 TEXT,
-            created_at TEXT NOT NULL
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schedules (
+            user_id INTEGER PRIMARY KEY,
+            times TEXT,
+            days TEXT,
+            timezone TEXT
         )
     """)
 
+    conn.commit()
+    conn.close()
 
-init_db()
+
+def ensure_user(user_id: int):
+    conn = db()
+
+    existing = conn.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+
+    if not existing:
+        conn.execute(
+            """
+            INSERT INTO users
+            (user_id, channel_id, timezone, schedule_enabled, created_at)
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            (
+                user_id,
+                TELEGRAM_CHANNEL_ID,
+                BOT_TIMEZONE,
+                datetime.utcnow().isoformat(),
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_channel_id(user_id: int):
+    ensure_user(user_id)
+
+    conn = db()
+    row = conn.execute(
+        "SELECT channel_id FROM users WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+
+    if row and row["channel_id"]:
+        return row["channel_id"]
+
+    return TELEGRAM_CHANNEL_ID
+
+
+def set_channel_id(user_id: int, channel_id: str):
+    ensure_user(user_id)
+
+    conn = db()
+    conn.execute(
+        "UPDATE users SET channel_id = ? WHERE user_id = ?",
+        (str(channel_id), user_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ============================================================
-# IN-MEMORY USER STATES
+# CATEGORY
 # ============================================================
 
-USER_STATE = {}
-
-
-def state_for(user_id):
-    if user_id not in USER_STATE:
-        USER_STATE[user_id] = {}
-    return USER_STATE[user_id]
-
-
-# ============================================================
-# CATEGORY SYSTEM
-# ============================================================
-
-CATEGORY_MAP = {
+CATEGORY_HASHTAGS = {
     "парфюм": "#парфюм",
-    "парфюмерия": "#парфюм",
-    "духи": "#парфюм",
-    "туалетная вода": "#парфюм",
-    "парфюмерная вода": "#парфюм",
-
-    "тональный": "#тональный_крем",
     "тональный крем": "#тональный_крем",
-    "foundation": "#тональный_крем",
-
     "крем": "#крем",
-    "крем для лица": "#крем",
-    "уходовый крем": "#крем",
-
     "румяна": "#румяна",
-    "blush": "#румяна",
-
     "бронзер": "#бронзер",
-    "bronzer": "#бронзер",
-
     "пудра": "#пудра",
-    "powder": "#пудра",
-
     "тени": "#тени",
-    "eyeshadow": "#тени",
-
     "тушь": "#тушь",
-    "mascara": "#тушь",
-
     "помада": "#помада",
-    "lipstick": "#помада",
-
-    "блеск": "#блеск_для_губ",
     "блеск для губ": "#блеск_для_губ",
-    "lip gloss": "#блеск_для_губ",
-
     "карандаш": "#карандаш",
-    "карандаш для глаз": "#карандаш",
-    "карандаш для губ": "#карандаш",
-
     "хайлайтер": "#хайлайтер",
-    "highlighter": "#хайлайтер",
-
     "консилер": "#консилер",
-    "concealer": "#консилер",
-
     "маска": "#маска",
-    "маска для лица": "#маска",
-
     "сыворотка": "#сыворотка",
-    "serum": "#сыворотка",
-
     "шампунь": "#шампунь",
-    "shampoo": "#шампунь",
-
     "кондиционер": "#кондиционер",
-    "conditioner": "#кондиционер",
-
     "набор": "#набор",
-    "сет": "#набор",
-    "комплект": "#набор",
+    "комплект": "#комплект",
 }
 
 
-def normalize_category(value: str) -> str:
-    if not value:
-        return "#другое"
+def category_hashtag(category: str) -> str:
+    if not category:
+        return "#новинка"
 
-    value = value.lower().strip()
+    category = category.lower().strip()
 
-    if value.startswith("#"):
-        value = value[1:]
-
-    if value in CATEGORY_MAP:
-        return CATEGORY_MAP[value]
-
-    for key, tag in CATEGORY_MAP.items():
-        if key in value:
+    for key, tag in CATEGORY_HASHTAGS.items():
+        if key in category:
             return tag
 
-    value = re.sub(r"[^a-zA-Zа-яА-Я0-9_]+", "_", value)
-    value = value.strip("_")
-
-    if not value:
-        return "#другое"
-
-    return "#" + value.lower()
+    return "#новинка"
 
 
 # ============================================================
-# HELPERS
+# TELEGRAM MENU
 # ============================================================
 
-def now_iso():
-    return datetime.utcnow().isoformat()
+def main_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📦 Добавить товар", callback_data="add_product"),
+            InlineKeyboardButton("📝 Создать пост", callback_data="create_post"),
+        ],
+        [
+            InlineKeyboardButton("📅 Расписание", callback_data="schedule"),
+            InlineKeyboardButton("📋 Очередь", callback_data="queue"),
+        ],
+        [
+            InlineKeyboardButton("💡 Контент-план", callback_data="content_plan"),
+            InlineKeyboardButton("📊 Идеи", callback_data="ideas"),
+        ],
+        [
+            InlineKeyboardButton("🗳️ Опрос", callback_data="poll"),
+            InlineKeyboardButton("📢 Канал", callback_data="channel"),
+        ],
+    ])
 
 
-def escape_caption(text: str) -> str:
-    """
-    Убираем ссылки и лишний мусор из текста.
-    """
-    if not text:
-        return ""
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ensure_user(user_id)
 
-    text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-
-    # Убираем строки с источниками.
-    text = re.sub(
-        r"(?im)^\s*(источники|source|sources|ссылки)\s*:?.*$",
-        "",
-        text,
+    await update.message.reply_text(
+        "Привет! 💗\n\n"
+        "Я твой Beauty Manager.\n\n"
+        "Ты можешь просто прислать мне фото товара "
+        "и написать цену и количество — остальное я сделаю сама:\n\n"
+        "📸 распознаю товар\n"
+        "🔎 найду информацию\n"
+        "📝 напишу описание\n"
+        "🖼️ подготовлю фотографии\n"
+        "📦 укажу наличие\n"
+        "💰 поставлю твою цену\n"
+        "✅ отправлю тебе на утверждение\n\n"
+        "Без твоего подтверждения ничего не публикуется.",
+        reply_markup=main_menu(),
     )
 
-    text = re.sub(r"\n{3,}", "\n\n", text)
 
-    return text.strip()
+# ============================================================
+# OPENAI HELPERS
+# ============================================================
 
+async def ask_openai(
+    prompt: str,
+    images: Optional[list[str]] = None,
+    web_search: bool = False,
+) -> str:
 
-def truncate_caption(text: str, limit=1000):
-    if len(text) <= limit:
-        return text
-
-    return text[:limit - 3].rstrip() + "..."
-
-
-def parse_price_stock(text: str):
-    """
-    Поддерживает:
-    7500 ₽
-    7500 руб
-    7500
-    2 шт
-    наличие 2
-    в наличии 2
-    """
-
-    price = None
-    stock = None
-
-    price_match = re.search(
-        r"(\d[\d\s]{2,8})\s*(?:₽|руб\.?|рублей)?",
-        text,
-        re.IGNORECASE,
-    )
-
-    if price_match:
-        raw = price_match.group(1).replace(" ", "")
-        try:
-            value = int(raw)
-            if value >= 100:
-                price = f"{value:,}".replace(",", " ") + " ₽"
-        except Exception:
-            pass
-
-    stock_match = re.search(
-        r"(?:в\s*наличии|наличие|осталось|остаток|шт\.?|штук)"
-        r"\s*[:\-]?\s*(\d+)",
-        text,
-        re.IGNORECASE,
-    )
-
-    if stock_match:
-        stock = stock_match.group(1)
-
-    # вариант "2 шт"
-    if not stock:
-        stock_match = re.search(
-            r"\b(\d+)\s*(?:шт\.?|штук)\b",
-            text,
-            re.IGNORECASE,
-        )
-        if stock_match:
-            stock = stock_match.group(1)
-
-    return price, stock
-
-
-async def download_image(url: str):
-    """
-    Скачиваем найденную картинку и возвращаем bytes.
-    """
-    if not url:
-        return None
-
-    try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/125 Safari/537.36"
-            )
+    content = [
+        {
+            "type": "input_text",
+            "text": prompt,
         }
+    ]
 
-        async with httpx.AsyncClient(
-            timeout=20,
-            follow_redirects=True,
-            headers=headers,
-        ) as client:
-            r = await client.get(url)
+    if images:
+        for image_data in images:
+            content.append({
+                "type": "input_image",
+                "image_url": image_data,
+            })
 
-            if r.status_code != 200:
-                return None
-
-            content_type = r.headers.get("content-type", "").lower()
-
-            if "image" not in content_type:
-                return None
-
-            if len(r.content) < 5_000:
-                return None
-
-            return r.content
-
-    except Exception as e:
-        logger.warning("Image download failed: %s", e)
-        return None
-
-
-# ============================================================
-# OPENAI
-# ============================================================
-
-async def ai_request(prompt: str, web=False):
-    kwargs = {
+    request = {
         "model": MODEL,
-        "input": prompt,
+        "input": [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
     }
 
-    if web:
-        kwargs["tools"] = [
+    if web_search:
+        request["tools"] = [
             {
-                "type": "web_search",
-                "search_context_size": "high",
+                "type": "web_search"
             }
         ]
 
-    response = await openai_client.responses.create(**kwargs)
+    response = await client.responses.create(**request)
 
-    return response.output_text or ""
+    return response.output_text.strip()
 
 
-async def identify_product(product_hint: str):
-    prompt = f"""
-Ты — AI-менеджер Telegram-магазина оригинальной косметики и парфюмерии.
+def clean_json(text: str):
+    text = text.strip()
 
-Определи товар по описанию пользователя.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text)
+        text = re.sub(r"```$", "", text)
+        text = text.strip()
 
-Описание:
-{product_hint}
+    return text
 
-Нужно вернуть ТОЛЬКО JSON:
 
-{{
-  "name": "...",
-  "brand": "...",
-  "category": "...",
-  "item_type": "single|set|bundle|multiple_separate",
-  "volume": "...",
-  "shade": "...",
-  "search_query": "..."
-}}
+async def ask_json(
+    prompt: str,
+    images: Optional[list[str]] = None,
+    web_search: bool = False,
+):
+    text = await ask_openai(
+        prompt,
+        images=images,
+        web_search=web_search,
+    )
 
-Правила:
-- Если несколько средств продаются вместе как один набор — item_type = "set".
-- Если это просто несколько отдельных товаров — multiple_separate.
-- Не придумывай оттенок или объём.
-- Если информации нет, оставляй пустую строку.
-- category должна быть короткой: например "парфюм", "румяна",
-  "бронзер", "тональный крем", "пудра", "тени", "тушь", "крем".
-"""
-
-    raw = await ai_request(prompt, web=False)
+    text = clean_json(text)
 
     try:
-        match = re.search(r"\{.*\}", raw, re.S)
+        return json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, re.S)
 
         if match:
-            return json.loads(match.group(0))
-    except Exception:
-        pass
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                pass
 
-    return {
-        "name": product_hint[:100],
-        "brand": "",
-        "category": "другое",
-        "item_type": "single",
-        "volume": "",
-        "shade": "",
-        "search_query": product_hint,
-    }
-
-
-async def research_product(info):
-    """
-    Ищем актуальную информацию и ссылки на изображения.
-    Источники не попадут в пользовательскую карточку.
-    """
-
-    prompt = f"""
-Найди актуальную информацию о товаре.
-
-Товар:
-{json.dumps(info, ensure_ascii=False)}
-
-Используй web search.
-
-Приоритет:
-1. официальный сайт бренда;
-2. официальный магазин;
-3. крупные проверенные магазины.
-
-Нужно вернуть ТОЛЬКО JSON:
-
-{{
-  "name": "...",
-  "description": "...",
-  "volume": "...",
-  "shade": "...",
-  "category": "...",
-  "item_type": "single|set|bundle|multiple_separate",
-  "product_image_url": "...",
-  "packaging_image_url": "..."
-}}
-
-Изображения:
-- product_image_url — фотография самого продукта без коробки,
-  если такая доступна;
-- packaging_image_url — фотография продукта вместе с упаковкой/коробкой,
-  если такая доступна.
-
-Очень важно:
-- не придумывай URL;
-- если подходящего изображения нет, ставь пустую строку;
-- не добавляй источники;
-- не добавляй markdown;
-- описание должно быть коротким и пригодным для Telegram;
-- не придумывай свойства, которых нет в источниках.
-"""
-
-    raw = await ai_request(prompt, web=True)
-
-    try:
-        match = re.search(r"\{.*\}", raw, re.S)
-
-        if match:
-            return json.loads(match.group(0))
-    except Exception:
-        pass
-
-    return {
-        "name": info.get("name", ""),
-        "description": "",
-        "volume": info.get("volume", ""),
-        "shade": info.get("shade", ""),
-        "category": info.get("category", "другое"),
-        "item_type": info.get("item_type", "single"),
-        "product_image_url": "",
-        "packaging_image_url": "",
-    }
+    return {}
 
 
 # ============================================================
-# IMAGE SEARCH FALLBACK
+# IMAGE PROCESSING
 # ============================================================
 
-async def image_from_page(page_url: str):
-    """
-    Пытаемся достать og:image / twitter:image / JSON-LD / img.
-    """
+async def telegram_photo_to_data_url(bot, file_id: str) -> Optional[str]:
+    try:
+        telegram_file = await bot.get_file(file_id)
 
-    if not page_url:
+        data = await telegram_file.download_as_bytearray()
+
+        encoded = base64.b64encode(data).decode("utf-8")
+
+        return f"data:image/jpeg;base64,{encoded}"
+
+    except Exception as e:
+        logger.exception("Cannot download Telegram image: %s", e)
         return None
+
+
+# ============================================================
+# PRODUCT RESEARCH
+# ============================================================
+
+PRODUCT_RESEARCH_PROMPT = """
+Ты — профессиональный beauty-редактор и товаровед интернет-магазина
+оригинальной косметики и парфюмерии.
+
+Тебе будут переданы фотографии товара и, возможно, подсказка пользователя.
+
+Твоя задача:
+
+1. Определи точное название товара.
+2. Определи бренд.
+3. Определи категорию.
+4. Пойми, является ли это:
+   - single — один товар;
+   - set — набор;
+   - bundle — комплект;
+   - multiple_separate — несколько отдельных товаров.
+5. Если это набор, считай его ОДНИМ товаром.
+6. Найди актуальную информацию о товаре через интернет.
+7. В первую очередь используй:
+   - официальный сайт бренда;
+   - официальный магазин бренда;
+   - крупные проверенные магазины.
+8. Не выдумывай характеристики.
+
+ОЧЕНЬ ВАЖНО:
+
+Для косметики укажи, если информация подтверждается:
+- что это за продукт;
+- для чего нужен;
+- текстуру;
+- финиш;
+- покрытие;
+- тип кожи;
+- проблемы/задачи, для которых подходит;
+- основные свойства;
+- эффект;
+- оттенок;
+- объём;
+- способ применения.
+
+Для парфюма:
+- семейство;
+- верхние ноты;
+- ноты сердца;
+- базовые ноты;
+- характер аромата;
+- для какого времени/сезона подходит, только если это можно обоснованно определить;
+- кому может понравиться.
+
+Для наборов:
+- считай весь набор одним товаром;
+- перечисли содержимое;
+- объясни назначение набора;
+- не разбивай его на отдельные товары;
+- укажи, подходит ли он для подарка, если это подтверждается.
+
+Описание должно быть информативным, но понятным обычному покупателю.
+
+Не используй рекламную ложь.
+Не придумывай свойства.
+Если характеристика неизвестна — оставь пустой строкой.
+
+Верни ТОЛЬКО JSON следующего формата:
+
+{
+  "name": "",
+  "brand": "",
+  "category": "",
+  "item_type": "single|set|bundle|multiple_separate",
+
+  "description": "",
+
+  "volume": "",
+  "shade": "",
+
+  "texture": "",
+  "finish": "",
+  "coverage": "",
+  "skin_type": "",
+  "skin_concerns": "",
+  "benefits": "",
+  "how_to_use": "",
+
+  "fragrance_family": "",
+  "fragrance_notes": "",
+  "fragrance_character": "",
+  "best_for": "",
+
+  "set_contents": "",
+  "set_description": "",
+
+  "product_image_url": "",
+  "packaging_image_url": ""
+}
+"""
+
+
+async def research_product(
+    image_urls: list[str],
+    user_hint: str = "",
+):
+
+    prompt = PRODUCT_RESEARCH_PROMPT
+
+    if user_hint:
+        prompt += f"""
+
+Дополнительная информация от продавца:
+
+{user_hint}
+
+Используй её как подсказку, но всё равно проверяй информацию.
+"""
+
+    return await ask_json(
+        prompt,
+        images=image_urls,
+        web_search=True,
+    )
+
+
+# ============================================================
+# IMAGE URL EXTRACTION
+# ============================================================
+
+async def extract_images_from_page(url: str) -> list[str]:
+    if not url:
+        return []
 
     try:
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/125 Safari/537.36"
+                "AppleWebKit/537.36 Chrome/130 Safari/537.36"
             )
         }
 
         async with httpx.AsyncClient(
-            timeout=20,
+            timeout=15,
             follow_redirects=True,
             headers=headers,
-        ) as client:
-            r = await client.get(page_url)
+        ) as client_http:
 
-        if r.status_code != 200:
-            return None
+            response = await client_http.get(url)
 
-        soup = BeautifulSoup(r.text, "html.parser")
+        if response.status_code >= 400:
+            return []
 
-        for selector in [
-            ('meta[property="og:image"]', "content"),
-            ('meta[name="twitter:image"]', "content"),
-        ]:
-            tag = soup.select_one(selector[0])
-            if tag and tag.get(selector[1]):
-                return urljoin(page_url, tag.get(selector[1]))
+        soup = BeautifulSoup(response.text, "html.parser")
 
-        # JSON-LD
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.get_text(strip=True))
+        result = []
 
-                if isinstance(data, dict):
-                    image = data.get("image")
+        for meta in soup.find_all("meta"):
+            prop = meta.get("property", "")
+            name = meta.get("name", "")
 
-                    if isinstance(image, str):
-                        return urljoin(page_url, image)
+            if prop in ("og:image", "og:image:url") or name in (
+                "twitter:image",
+            ):
+                content = meta.get("content")
 
-                    if isinstance(image, list) and image:
-                        return urljoin(page_url, image[0])
+                if content and content.startswith("http"):
+                    result.append(content)
 
-            except Exception:
-                continue
-
-        # обычные img
         for img in soup.find_all("img"):
-            src = (
-                img.get("src")
-                or img.get("data-src")
-                or img.get("data-original")
-            )
+            src = img.get("src")
 
-            if src and src.startswith(("http://", "https://", "/")):
-                return urljoin(page_url, src)
+            if src and src.startswith("http"):
+                result.append(src)
 
-    except Exception as e:
-        logger.warning("Page image search failed: %s", e)
+        unique = []
 
-    return None
+        for item in result:
+            if item not in unique:
+                unique.append(item)
+
+        return unique[:10]
+
+    except Exception:
+        return []
 
 
-async def get_best_image(url: str):
+async def find_better_product_images(data: dict):
     """
-    Сначала пробуем URL как картинку.
-    Если это страница — ищем картинку внутри.
+    Если OpenAI нашёл страницу/URL картинки — пытаемся
+    получить две реальные картинки.
     """
 
-    if not url:
-        return None
+    product_url = data.get("product_image_url", "")
+    packaging_url = data.get("packaging_image_url", "")
 
-    image = await download_image(url)
+    images = []
 
-    if image:
-        return image
+    if product_url and product_url.startswith("http"):
+        if any(x in product_url.lower() for x in [".jpg", ".jpeg", ".png", ".webp"]):
+            images.append(product_url)
+        else:
+            page_images = await extract_images_from_page(product_url)
 
-    page_image = await image_from_page(url)
+            if page_images:
+                images.append(page_images[0])
 
-    if page_image:
-        return await download_image(page_image)
+    if packaging_url and packaging_url.startswith("http"):
+        if any(x in packaging_url.lower() for x in [".jpg", ".jpeg", ".png", ".webp"]):
+            images.append(packaging_url)
+        else:
+            page_images = await extract_images_from_page(packaging_url)
 
-    return None
+            if page_images:
+                images.append(page_images[0])
+
+    unique = []
+
+    for img in images:
+        if img not in unique:
+            unique.append(img)
+
+    return unique[:2]
 
 
 # ============================================================
 # PRODUCT CAPTION
 # ============================================================
 
-def build_product_caption(data):
-    category = normalize_category(data.get("category", ""))
+def shorten(text: str, limit: int):
+    if not text:
+        return ""
 
-    name = data.get("name", "").strip()
-    description = escape_caption(data.get("description", ""))
+    text = str(text).strip()
 
-    volume = data.get("volume", "").strip()
-    shade = data.get("shade", "").strip()
+    if len(text) <= limit:
+        return text
 
-    price = data.get("price", "").strip()
-    stock = data.get("stock", "").strip()
+    return text[:limit - 1].rstrip() + "…"
 
+
+def build_product_caption(
+    data: dict,
+    price: str,
+    stock: str,
+) -> str:
+
+    category = data.get("category", "")
     item_type = data.get("item_type", "single")
 
-    if item_type == "set" and category == "#другое":
-        category = "#набор"
+    hashtag = category_hashtag(category)
 
-    lines = [
-        category,
-        "",
-        f"✨ {name}",
-    ]
+    name = data.get("name", "Товар")
+    brand = data.get("brand", "")
+
+    if brand and brand.lower() not in name.lower():
+        title = f"{brand} {name}"
+    else:
+        title = name
+
+    parts = []
+
+    parts.append(hashtag)
+    parts.append("")
+    parts.append(f"✨ {title}")
+
+    description = data.get("description", "")
 
     if description:
-        lines.extend([
-            "",
-            description,
-        ])
+        parts.append("")
+        parts.append(shorten(description, 360))
+
+    # --------------------------------------------------------
+    # PERFUME
+    # --------------------------------------------------------
+
+    if "парф" in category.lower():
+
+        family = data.get("fragrance_family", "")
+        notes = data.get("fragrance_notes", "")
+        character = data.get("fragrance_character", "")
+        best_for = data.get("best_for", "")
+
+        if family:
+            parts.append(f"\n🌸 Семейство: {family}")
+
+        if notes:
+            parts.append(f"✨ Ноты: {notes}")
+
+        if character:
+            parts.append(f"💫 Характер: {character}")
+
+        if best_for:
+            parts.append(f"🕐 Подойдёт: {best_for}")
+
+    # --------------------------------------------------------
+    # COSMETICS
+    # --------------------------------------------------------
+
+    else:
+
+        texture = data.get("texture", "")
+        finish = data.get("finish", "")
+        coverage = data.get("coverage", "")
+        skin_type = data.get("skin_type", "")
+        skin_concerns = data.get("skin_concerns", "")
+        benefits = data.get("benefits", "")
+
+        if texture:
+            parts.append(f"\n🫧 Текстура: {texture}")
+
+        if finish:
+            parts.append(f"✨ Финиш: {finish}")
+
+        if coverage:
+            parts.append(f"🎨 Покрытие: {coverage}")
+
+        if skin_type:
+            parts.append(f"🌿 Тип кожи: {skin_type}")
+
+        if skin_concerns:
+            parts.append(f"💗 Подходит для: {skin_concerns}")
+
+        if benefits:
+            parts.append(f"💎 Эффект: {benefits}")
+
+    # --------------------------------------------------------
+    # SET
+    # --------------------------------------------------------
+
+    if item_type in ("set", "bundle"):
+
+        set_description = data.get("set_description", "")
+        set_contents = data.get("set_contents", "")
+
+        if set_description:
+            parts.append(f"\n🎁 О наборе: {set_description}")
+
+        if set_contents:
+            parts.append(f"📦 В составе: {set_contents}")
+
+    volume = data.get("volume", "")
+    shade = data.get("shade", "")
 
     if volume:
-        lines.append(f"\n📦 Объём: {volume}")
+        parts.append(f"\n📦 Объём: {volume}")
 
     if shade:
-        lines.append(f"🎨 Оттенок: {shade}")
+        parts.append(f"🎨 Оттенок: {shade}")
 
-    if price:
-        lines.append(f"\n💰 Цена: {price}")
+    parts.append("")
+    parts.append(f"💰 Цена: {price}")
+    parts.append(f"📦 В наличии: {stock}")
 
-    if stock:
-        lines.append(f"📦 В наличии: {stock} шт.")
+    caption = "\n".join(parts)
 
-    return truncate_caption("\n".join(lines), 1000)
+    return shorten(caption, MAX_CAPTION_LENGTH)
 
 
 # ============================================================
-# MAIN MENU
+# PRODUCT STATE
 # ============================================================
 
-def main_menu():
-    return ReplyKeyboardMarkup(
-        [
-            [
-                KeyboardButton("🛍 Новый товар"),
-                KeyboardButton("✍️ Новый пост"),
-            ],
-            [
-                KeyboardButton("📅 Контент-план"),
-                KeyboardButton("⏰ Расписание"),
-            ],
-            [
-                KeyboardButton("📋 Очередь"),
-                KeyboardButton("📊 Идеи продвижения"),
-            ],
-            [
-                KeyboardButton("🎬 Reels / TikTok"),
-                KeyboardButton("📱 Stories"),
-            ],
-            [
-                KeyboardButton("📊 Опрос"),
-                KeyboardButton("💡 Что опубликовать?"),
-            ],
-            [
-                KeyboardButton("⚙️ Настройки"),
-            ],
-        ],
-        resize_keyboard=True,
+def get_state(user_id: int):
+    return USER_STATE.setdefault(user_id, {})
+
+
+def clear_state(user_id: int):
+    USER_STATE[user_id] = {}
+
+
+def parse_price_stock(text: str):
+    price = None
+    stock = None
+
+    if not text:
+        return price, stock
+
+    price_match = re.search(
+        r"(\d[\d\s]*(?:[.,]\d+)?)\s*(?:₽|руб|рублей)?",
+        text,
+        re.I,
     )
 
+    if price_match:
+        value = price_match.group(1)
+        value = value.replace(" ", "").replace(",", ".")
+        price = value
+
+        if "." in price:
+            try:
+                price = str(float(price)).rstrip("0").rstrip(".")
+            except Exception:
+                pass
+
+    stock_match = re.search(
+        r"(?:в\s*наличии|наличие|шт\.?|штук|количество)\s*[:\-]?\s*(\d+)",
+        text,
+        re.I,
+    )
+
+    if stock_match:
+        stock = stock_match.group(1)
+
+    return price, stock
+
 
 # ============================================================
-# /START
+# PRODUCT CREATION
 # ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def create_product_card(
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-    db_execute(
+    state = get_state(user_id)
+
+    user_photos = state.get("photos", [])
+    product_hint = state.get("product_hint", "")
+
+    price = state.get("price", "")
+    stock = state.get("stock", "1")
+
+    if not user_photos:
+        return
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="🔎 Определяю товар и ищу актуальную информацию...\n"
+             "Это может занять немного времени 💗"
+    )
+
+    image_data_urls = []
+
+    for file_id in user_photos[:2]:
+        data_url = await telegram_photo_to_data_url(
+            context.bot,
+            file_id,
+        )
+
+        if data_url:
+            image_data_urls.append(data_url)
+
+    try:
+        data = await research_product(
+            image_urls=image_data_urls,
+            user_hint=product_hint,
+        )
+
+    except Exception as e:
+        logger.exception("Product research failed: %s", e)
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "Не получилось найти информацию о товаре 😔\n\n"
+                "Попробуй ещё раз и напиши название товара "
+                "в подписи к фотографии."
+            ),
+        )
+        return
+
+    if not data:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="Не удалось распознать товар 😔\n"
+                 "Напиши его название вместе с фото и попробуй ещё раз."
+        )
+        return
+
+    # --------------------------------------------------------
+    # USER OVERRIDES
+    # --------------------------------------------------------
+
+    if not price:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="💰 Напиши цену товара, например:\n\n8500 ₽"
+        )
+
+        state["awaiting"] = "price"
+        state["research_data"] = data
+
+        return
+
+    if not stock:
+        stock = "1"
+
+    # --------------------------------------------------------
+    # SAVE PRODUCT
+    # --------------------------------------------------------
+
+    caption = build_product_caption(
+        data,
+        price,
+        stock,
+    )
+
+    item_id = save_product(
+        user_id=user_id,
+        data=data,
+        price=price,
+        stock=stock,
+        photo1=user_photos[0] if user_photos else "",
+        photo2=user_photos[1] if len(user_photos) > 1 else "",
+    )
+
+    # --------------------------------------------------------
+    # FIND ONLINE IMAGES
+    # --------------------------------------------------------
+
+    online_images = await find_better_product_images(data)
+
+    photo1 = user_photos[0] if user_photos else ""
+    photo2 = user_photos[1] if len(user_photos) > 1 else ""
+
+    # --------------------------------------------------------
+    # SEND TWO PHOTOS
+    # --------------------------------------------------------
+
+    sent_as_album = False
+
+    if len(online_images) >= 2:
+
+        try:
+            media = [
+                InputMediaPhoto(
+                    media=online_images[0],
+                    caption=caption,
+                ),
+                InputMediaPhoto(
+                    media=online_images[1],
+                ),
+            ]
+
+            await context.bot.send_media_group(
+                chat_id=user_id,
+                media=media,
+            )
+
+            sent_as_album = True
+
+        except Exception:
+            logger.exception("Online album failed")
+
+    if not sent_as_album and photo1 and photo2:
+
+        try:
+            media = [
+                InputMediaPhoto(
+                    media=photo1,
+                    caption=caption,
+                ),
+                InputMediaPhoto(
+                    media=photo2,
+                ),
+            ]
+
+            await context.bot.send_media_group(
+                chat_id=user_id,
+                media=media,
+            )
+
+            sent_as_album = True
+
+        except Exception:
+            logger.exception("Telegram photo album failed")
+
+    if not sent_as_album:
+
+        if online_images:
+
+            try:
+                await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=online_images[0],
+                    caption=caption,
+                )
+                sent_as_album = True
+            except Exception:
+                pass
+
+        if not sent_as_album and photo1:
+
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=photo1,
+                caption=caption,
+            )
+
+    # --------------------------------------------------------
+    # APPROVAL
+    # --------------------------------------------------------
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Одобрить",
+                callback_data=f"approve_product:{item_id}",
+            ),
+            InlineKeyboardButton(
+                "✏️ Изменить",
+                callback_data=f"edit_product:{item_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🖼️ Другое фото",
+                callback_data=f"photo_product:{item_id}",
+            ),
+            InlineKeyboardButton(
+                "🔄 Новый товар",
+                callback_data="new_product",
+            ),
+        ],
+    ])
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=(
+            "⬆️ Проверь карточку товара.\n\n"
+            "Если всё правильно — нажми «Одобрить».\n"
+            "Только после этого товар попадёт в очередь публикации."
+        ),
+        reply_markup=keyboard,
+    )
+
+    clear_state(user_id)
+
+
+def save_product(
+    user_id: int,
+    data: dict,
+    price: str,
+    stock: str,
+    photo1: str,
+    photo2: str,
+):
+
+    conn = db()
+
+    cursor = conn.execute(
         """
-        INSERT OR IGNORE INTO users
-        (user_id, channel_id, timezone)
-        VALUES (?, ?, ?)
+        INSERT INTO products
+        (
+            user_id,
+            name,
+            category,
+            item_type,
+            price,
+            stock,
+            data_json,
+            photo1,
+            photo2,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
-            ENV_CHANNEL_ID or None,
-            DEFAULT_TIMEZONE,
+            data.get("name", ""),
+            data.get("category", ""),
+            data.get("item_type", "single"),
+            price,
+            stock,
+            json.dumps(data, ensure_ascii=False),
+            photo1,
+            photo2,
+            datetime.utcnow().isoformat(),
         ),
     )
 
-    state_for(user_id).clear()
+    conn.commit()
 
-    await update.message.reply_text(
-        "Привет! 💗\n\n"
-        "Я твой AI-менеджер магазина косметики и парфюмерии.\n\n"
-        "Ты можешь прислать мне товар — я сама:\n"
-        "• определю, что это;\n"
-        "• найду информацию;\n"
-        "• определю категорию;\n"
-        "• поставлю правильный хэштег;\n"
-        "• найду 2 фотографии;\n"
-        "• оформлю карточку;\n"
-        "• дождусь твоего одобрения;\n"
-        "• поставлю товар в очередь на публикацию.\n\n"
-        "Ничего в канал без твоего одобрения не уйдёт. ❤️",
-        reply_markup=main_menu(),
-    )
+    item_id = cursor.lastrowid
+
+    conn.close()
+
+    return item_id
 
 
 # ============================================================
-# PRODUCT FLOW
+# PHOTO HANDLER
 # ============================================================
 
-async def new_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_product_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    message = update.message
     user_id = update.effective_user.id
 
-    state = state_for(user_id)
-    state.clear()
-    state["mode"] = "product"
-    state["photos"] = []
+    ensure_user(user_id)
 
-    await update.message.reply_text(
-        "🛍 Отлично!\n\n"
-        "Пришли фото товара.\n\n"
-        "Можно:\n"
-        "• одно фото — я сама найду второе;\n"
-        "• сразу два фото — первое товара, второе с упаковкой.\n\n"
-        "В подписи можешь сразу написать, например:\n"
-        "7500 ₽, 2 шт."
-    )
+    state = get_state(user_id)
 
+    if "photos" not in state:
+        state["photos"] = []
 
-async def handle_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
+    # Telegram даёт несколько размеров.
+    photo = message.photo[-1]
 
-    if state.get("mode") != "product":
-        return
+    state["photos"].append(photo.file_id)
 
-    photo = update.message.photo[-1]
-    file_id = photo.file_id
+    caption = message.caption or ""
 
-    state.setdefault("photos", []).append(file_id)
-
-    caption = update.message.caption or ""
+    # Очень важно:
+    # сохраняем весь текст подписи как подсказку AI.
+    if caption:
+        state["product_hint"] = caption
 
     price, stock = parse_price_stock(caption)
 
@@ -790,704 +1104,1098 @@ async def handle_product_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         state["stock"] = stock
 
     if len(state["photos"]) == 1:
-        await update.message.reply_text(
-            "📸 Первое фото получила.\n\n"
-            "Если есть второе фото с упаковкой — пришли его сейчас.\n"
-            "Если второго нет, напиши цену и количество, например:\n\n"
-            "7500 ₽, 2 шт."
-        )
 
-    elif len(state["photos"]) == 2:
-        await update.message.reply_text(
-            "📸 Получила оба фото!\n\n"
-            "Теперь напиши цену и количество.\n\n"
+        await message.reply_text(
+            "📸 Первое фото получила!\n\n"
+            "Теперь можешь:\n"
+            "• прислать второе фото — например, упаковки;\n"
+            "• или сразу написать цену и количество.\n\n"
             "Например:\n"
-            "7500 ₽, 2 шт."
+            "8500 ₽, в наличии 2 шт."
         )
 
-    else:
-        # Не собираем больше двух.
-        state["photos"] = state["photos"][:2]
-
-        await update.message.reply_text(
-            "У меня уже есть два фото этого товара 💗\n"
-            "Теперь напиши цену и количество."
-        )
-
-
-async def handle_product_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
-
-    if state.get("mode") != "product":
-        return False
-
-    text = update.message.text.strip()
-
-    price, stock = parse_price_stock(text)
-
-    # Если цены/остатка нет, считаем текст описанием товара.
-    if not price:
-        state["product_hint"] = text
-
-        await update.message.reply_text(
-            "Хорошо 💗 Теперь напиши цену и количество.\n\n"
-            "Например:\n"
-            "7500 ₽, 2 шт."
-        )
-
-        return True
-
-    state["price"] = price
-
-    if stock:
-        state["stock"] = stock
-    else:
-        state["stock"] = "1"
-
-    await create_product_card(update, context)
-
-    return True
-
-
-async def create_product_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
-
-    photos = state.get("photos", [])
-
-    if not photos:
-        await update.message.reply_text(
-            "Мне сначала нужно фото товара 📸"
-        )
         return
 
-    price = state.get("price", "")
-    stock = state.get("stock", "1")
-    hint = state.get("product_hint", "")
+    if len(state["photos"]) >= 2:
 
-    await update.message.reply_text(
-        "🔎 Ищу товар и проверяю информацию...\n"
-        "Это может занять немного времени."
-    )
-
-    try:
-        info = await identify_product(hint or "Товар на фотографии")
-
-        research = await research_product(info)
-
-        # Если AI не определил название, используем пользовательское.
-        name = research.get("name") or info.get("name") or "Товар"
-
-        category = normalize_category(
-            research.get("category")
-            or info.get("category")
-            or "другое"
-        )
-
-        item_type = research.get("item_type") or info.get("item_type") or "single"
-
-        data = {
-            "name": name,
-            "description": research.get("description", ""),
-            "volume": research.get("volume") or info.get("volume", ""),
-            "shade": research.get("shade") or info.get("shade", ""),
-            "category": category,
-            "item_type": item_type,
-            "price": price,
-            "stock": stock,
-        }
-
-        # ----------------------------------------------------
-        # PHOTO 1
-        # ----------------------------------------------------
-
-        photo1 = photos[0]
-
-        # Если пользователь прислал только одно фото,
-        # пытаемся найти фотографию товара отдельно.
-        if len(photos) == 1:
-            online_1 = await get_best_image(
-                research.get("product_image_url", "")
+        if state.get("price"):
+            await create_product_card(
+                user_id,
+                context,
             )
-
-            if online_1:
-                msg1 = await update.message.reply_photo(
-                    photo=online_1,
-                )
-                photo1 = msg1.photo[-1].file_id
-
-        # ----------------------------------------------------
-        # PHOTO 2
-        # ----------------------------------------------------
-
-        photo2 = None
-
-        if len(photos) >= 2:
-            photo2 = photos[1]
-
         else:
-            online_2 = await get_best_image(
-                research.get("packaging_image_url", "")
+            await message.reply_text(
+                "Отлично, у меня есть два фото 🩷\n\n"
+                "Теперь напиши цену и количество.\n\n"
+                "Например:\n"
+                "8500 ₽, в наличии 2 шт."
             )
 
-            if online_2:
-                msg2 = await update.message.reply_photo(
-                    photo=online_2,
-                )
-                photo2 = msg2.photo[-1].file_id
-
-        # Если второго фото найти не получилось,
-        # используем первое как резерв.
-        if not photo2:
-            photo2 = photo1
-
-        data["category"] = category
-        data["item_type"] = item_type
-
-        caption = build_product_caption(data)
-
-        # ----------------------------------------------------
-        # SHOW PREVIEW
-        # ----------------------------------------------------
-
-        media = [
-            InputMediaPhoto(
-                media=photo1,
-                caption=caption,
-            ),
-            InputMediaPhoto(
-                media=photo2,
-            ),
-        ]
-
-        sent = await context.bot.send_media_group(
-            chat_id=user_id,
-            media=media,
-        )
-
-        # Telegram media group не поддерживает inline keyboard
-        # прямо на каждом элементе альбома.
-        # Поэтому кнопки идут отдельным сообщением.
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "✅ Одобрить",
-                        callback_data="product_approve",
-                    ),
-                    InlineKeyboardButton(
-                        "✏️ Изменить",
-                        callback_data="product_edit",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🖼 Другое фото",
-                        callback_data="product_other_photo",
-                    ),
-                    InlineKeyboardButton(
-                        "🔄 Новый товар",
-                        callback_data="product_new",
-                    ),
-                ],
-            ]
-        )
-
-        state["draft"] = data
-        state["draft"]["caption"] = caption
-        state["draft"]["photo1"] = photo1
-        state["draft"]["photo2"] = photo2
-
-        await update.message.reply_text(
-            "Готово! 💗\n\n"
-            "Первое фото — товар.\n"
-            "Второе — товар с упаковкой.\n\n"
-            "Проверь карточку. После «Одобрить» товар попадёт "
-            "в очередь публикаций по твоему расписанию.",
-            reply_markup=keyboard,
-        )
-
-    except Exception as e:
-        logger.exception("Product creation error")
-
-        await update.message.reply_text(
-            "Не получилось собрать карточку 😔\n\n"
-            f"Ошибка: {str(e)[:300]}"
-        )
-
 
 # ============================================================
-# CALLBACKS
+# TEXT HANDLER
 # ============================================================
 
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def handle_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-    user_id = query.from_user.id
-    state = state_for(user_id)
+    message = update.message
+    user_id = update.effective_user.id
+    text = (message.text or "").strip()
 
-    data = query.data
+    ensure_user(user_id)
 
-    if data == "product_new":
-        state.clear()
-        state["mode"] = "product"
-        state["photos"] = []
+    state = get_state(user_id)
 
-        await query.message.reply_text(
-            "🔄 Начинаем новый товар.\n\n"
-            "Пришли фото."
-        )
-        return
+    # --------------------------------------------------------
+    # WAITING FOR PRICE
+    # --------------------------------------------------------
 
-    if data == "product_other_photo":
-        state["waiting_new_photo"] = True
+    if state.get("awaiting") == "price":
 
-        await query.message.reply_text(
-            "🖼 Пришли новое фото.\n"
-            "Я заменю им первое фото карточки."
-        )
-        return
+        price, stock = parse_price_stock(text)
 
-    if data == "product_edit":
-        state["mode"] = "edit_product"
-
-        await query.message.reply_text(
-            "✏️ Что изменить?\n\n"
-            "Напиши одним сообщением, например:\n\n"
-            "цена 7900\n"
-            "или\n"
-            "оттенок 120\n"
-            "или\n"
-            "это набор\n"
-            "или\n"
-            "это #хайлайтер"
-        )
-        return
-
-    if data == "product_approve":
-        draft = state.get("draft")
-
-        if not draft:
-            await query.message.reply_text(
-                "Черновик уже недоступен. Создай товар заново."
+        if not price:
+            await message.reply_text(
+                "Напиши цену, например: 8500 ₽"
             )
             return
 
-        queue_id = add_product_to_queue(
+        data = state.get("research_data", {})
+
+        state["price"] = price
+        state["stock"] = stock or "1"
+        state.pop("awaiting", None)
+
+        caption = build_product_caption(
+            data,
+            state["price"],
+            state["stock"],
+        )
+
+        await message.reply_text(
+            "Готово 💗\n\n" + caption
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SCHEDULE INPUT
+    # --------------------------------------------------------
+
+    if state.get("awaiting") == "schedule_times":
+
+        await save_schedule_from_text(
             user_id,
-            draft,
+            text,
+            message,
         )
 
-        # Сохраняем товар.
-        db_execute(
-            """
-            INSERT INTO products (
-                user_id, category, item_type, name, description,
-                volume, shade, price, stock, photo1, photo2, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+        state.pop("awaiting", None)
+
+        return
+
+    # --------------------------------------------------------
+    # PRODUCT TEXT WITH PHOTO ALREADY RECEIVED
+    # --------------------------------------------------------
+
+    if state.get("photos"):
+
+        price, stock = parse_price_stock(text)
+
+        if price:
+            state["price"] = price
+
+        if stock:
+            state["stock"] = stock
+
+        # Если пользователь пишет название товара.
+        state["product_hint"] = text
+
+        if state.get("price"):
+
+            await create_product_card(
                 user_id,
-                draft.get("category"),
-                draft.get("item_type"),
-                draft.get("name"),
-                draft.get("description"),
-                draft.get("volume"),
-                draft.get("shade"),
-                draft.get("price"),
-                draft.get("stock"),
-                draft.get("photo1"),
-                draft.get("photo2"),
-                now_iso(),
-            ),
+                context,
+            )
+
+            return
+
+        await message.reply_text(
+            "Поняла 💗\n\n"
+            "Напиши цену товара, например:\n"
+            "8500 ₽, 2 шт."
         )
 
-        scheduled = db_execute(
-            "SELECT scheduled_at FROM queue WHERE id = ?",
-            (queue_id,),
-            commit=False,
-        ).fetchone()
+        return
 
-        state.clear()
+    # --------------------------------------------------------
+    # GENERAL TEXT COMMANDS
+    # --------------------------------------------------------
 
-        when = scheduled["scheduled_at"] if scheduled else ""
+    lowered = text.lower()
 
-        await query.message.reply_text(
-            "✅ Одобрено!\n\n"
-            "Товар добавлен в очередь.\n"
-            f"🕐 Планируемая публикация: {when}\n\n"
-            "Самостоятельно в канал я его отправлю только "
-            "по активному расписанию.",
+    if lowered in ("меню", "menu"):
+        await message.reply_text(
+            "Главное меню 💗",
             reply_markup=main_menu(),
         )
         return
 
+    if lowered in ("расписание", "schedule"):
+        await show_schedule(user_id, message)
+        return
+
+    if lowered in ("очередь", "queue"):
+        await show_queue(user_id, message)
+        return
+
+    if lowered in ("план", "контент-план"):
+        await generate_content_plan(user_id, message)
+        return
+
+    # Если пользователь просто прислал текст — предлагаем создать пост.
+    await message.reply_text(
+        "Я могу превратить это в готовый контент 💗\n\n"
+        "Выбери действие:",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📝 Сделать пост",
+                    callback_data="create_post",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💡 Идеи",
+                    callback_data="ideas",
+                ),
+                InlineKeyboardButton(
+                    "📅 Контент-план",
+                    callback_data="content_plan",
+                ),
+            ],
+        ]),
+    )
+
 
 # ============================================================
-# QUEUE / SCHEDULING
+# APPROVAL / CALLBACKS
 # ============================================================
 
-def get_user(user_id):
-    return db_execute(
-        "SELECT * FROM users WHERE user_id = ?",
-        (user_id,),
-        commit=False,
+async def callbacks(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data
+
+    ensure_user(user_id)
+
+    # --------------------------------------------------------
+    # ADD PRODUCT
+    # --------------------------------------------------------
+
+    if data == "add_product":
+
+        clear_state(user_id)
+
+        await query.message.reply_text(
+            "📦 Отлично!\n\n"
+            "Пришли мне фото товара.\n\n"
+            "Лучший вариант — 2 фото:\n"
+            "1️⃣ сам товар\n"
+            "2️⃣ товар + упаковка\n\n"
+            "Можно сразу написать подписью:\n\n"
+            "YSL Libre, 8500 ₽, 2 шт."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # NEW PRODUCT
+    # --------------------------------------------------------
+
+    if data == "new_product":
+
+        clear_state(user_id)
+
+        await query.message.reply_text(
+            "🔄 Хорошо!\n\n"
+            "Присылай новый товар."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # APPROVE PRODUCT
+    # --------------------------------------------------------
+
+    if data.startswith("approve_product:"):
+
+        item_id = int(data.split(":")[1])
+
+        product = get_product(item_id, user_id)
+
+        if not product:
+            await query.message.reply_text(
+                "Товар не найден."
+            )
+            return
+
+        await approve_product(
+            user_id,
+            product,
+            context,
+            query.message,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # EDIT PRODUCT
+    # --------------------------------------------------------
+
+    if data.startswith("edit_product:"):
+
+        item_id = int(data.split(":")[1])
+
+        await query.message.reply_text(
+            "✏️ Напиши, что изменить.\n\n"
+            "Например:\n"
+            "• изменить цену на 7900\n"
+            "• в наличии 3 шт.\n"
+            "• убрать информацию про подарок\n"
+            "• сделать описание короче"
+        )
+
+        state = get_state(user_id)
+
+        state["editing_product_id"] = item_id
+
+        return
+
+    # --------------------------------------------------------
+    # OTHER PHOTO
+    # --------------------------------------------------------
+
+    if data.startswith("photo_product:"):
+
+        await query.message.reply_text(
+            "🖼️ Хорошо!\n\n"
+            "Пришли новое фото товара."
+        )
+
+        state = get_state(user_id)
+
+        state["replace_photo"] = True
+
+        return
+
+    # --------------------------------------------------------
+    # SCHEDULE
+    # --------------------------------------------------------
+
+    if data == "schedule":
+
+        await show_schedule(
+            user_id,
+            query.message,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # QUEUE
+    # --------------------------------------------------------
+
+    if data == "queue":
+
+        await show_queue(
+            user_id,
+            query.message,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # CONTENT PLAN
+    # --------------------------------------------------------
+
+    if data == "content_plan":
+
+        await generate_content_plan(
+            user_id,
+            query.message,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # IDEAS
+    # --------------------------------------------------------
+
+    if data == "ideas":
+
+        await generate_ideas(
+            user_id,
+            query.message,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # CREATE POST
+    # --------------------------------------------------------
+
+    if data == "create_post":
+
+        await create_post(
+            user_id,
+            query.message,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # POLL
+    # --------------------------------------------------------
+
+    if data == "poll":
+
+        await create_poll_idea(
+            user_id,
+            query.message,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # CHANNEL
+    # --------------------------------------------------------
+
+    if data == "channel":
+
+        await query.message.reply_text(
+            "📢 Подключение канала\n\n"
+            "1. Добавь меня администратором канала.\n"
+            "2. Дай право публиковать сообщения.\n"
+            "3. Затем перешли мне любое сообщение из этого канала.\n\n"
+            "Я попробую определить канал автоматически."
+        )
+
+        return
+
+
+# ============================================================
+# PRODUCTS DATABASE
+# ============================================================
+
+def get_product(item_id: int, user_id: int):
+
+    conn = db()
+
+    row = conn.execute(
+        """
+        SELECT *
+        FROM products
+        WHERE id = ? AND user_id = ?
+        """,
+        (item_id, user_id),
     ).fetchone()
 
-
-def get_channel_id(user_id):
-    row = get_user(user_id)
-
-    if row and row["channel_id"]:
-        return row["channel_id"]
-
-    if ENV_CHANNEL_ID:
-        return ENV_CHANNEL_ID
-
-    return None
-
-
-def schedule_config(user_id):
-    row = get_user(user_id)
+    conn.close()
 
     if not row:
-        db_execute(
-            """
-            INSERT OR IGNORE INTO users
-            (user_id, timezone)
-            VALUES (?, ?)
-            """,
-            (user_id, DEFAULT_TIMEZONE),
+        return None
+
+    item = dict(row)
+
+    try:
+        item["data"] = json.loads(item["data_json"])
+    except Exception:
+        item["data"] = {}
+
+    return item
+
+
+# ============================================================
+# APPROVE PRODUCT
+# ============================================================
+
+async def approve_product(
+    user_id: int,
+    product: dict,
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+):
+
+    channel_id = get_channel_id(user_id)
+
+    if not channel_id:
+
+        await message.reply_text(
+            "⚠️ Сначала подключи Telegram-канал.\n\n"
+            "Нажми «📢 Канал» в меню."
         )
 
-        row = get_user(user_id)
+        return
 
-    try:
-        days = json.loads(row["schedule_days"])
-    except Exception:
-        days = list(range(7))
+    data = product["data"]
 
-    try:
-        times = json.loads(row["schedule_times"])
-    except Exception:
-        times = ["10:00", "15:00", "20:00"]
+    caption = build_product_caption(
+        data,
+        product["price"],
+        product["stock"],
+    )
 
-    return {
-        "enabled": bool(row["schedule_enabled"]),
-        "days": days,
-        "times": times,
-        "timezone": row["timezone"] or DEFAULT_TIMEZONE,
-    }
+    photo1 = product.get("photo1", "")
+    photo2 = product.get("photo2", "")
 
+    publish_at = get_next_publish_time(
+        user_id,
+    )
 
-def parse_schedule_days(value):
-    value = value.strip().lower()
+    queue_id = add_queue_item(
+        user_id=user_id,
+        channel_id=channel_id,
+        content_type="product",
+        text=caption,
+        photo1=photo1,
+        photo2=photo2,
+        publish_at=publish_at,
+    )
 
-    if value in ("каждый день", "ежедневно", "все", "7"):
-        return list(range(7))
-
-    result = []
-
-    for part in re.split(r"[,\s]+", value):
-        try:
-            number = int(part)
-
-            if 1 <= number <= 7:
-                # Пн=0 ... Вс=6
-                result.append(number - 1)
-
-        except Exception:
-            pass
-
-    return sorted(set(result))
+    await message.reply_text(
+        "✅ Товар одобрен!\n\n"
+        f"📅 Поставила в очередь на:\n"
+        f"{format_dt(publish_at)}\n\n"
+        "До этого момента он не будет опубликован."
+    )
 
 
-def valid_times(value):
-    result = []
+# ============================================================
+# QUEUE
+# ============================================================
 
-    for part in re.split(r"[,\s;]+", value.strip()):
-        if re.match(r"^\d{1,2}:\d{2}$", part):
-            h, m = part.split(":")
-            h = int(h)
-            m = int(m)
+def add_queue_item(
+    user_id: int,
+    channel_id: str,
+    content_type: str,
+    text: str,
+    photo1: str = "",
+    photo2: str = "",
+    publish_at: Optional[datetime] = None,
+):
 
-            if 0 <= h <= 23 and 0 <= m <= 59:
-                result.append(f"{h:02d}:{m:02d}")
+    if publish_at is None:
+        publish_at = get_next_publish_time(user_id)
 
-    return sorted(set(result))
+    conn = db()
 
-
-def next_schedule_slot(user_id):
-    config = schedule_config(user_id)
-
-    tz = ZoneInfo(config["timezone"])
-
-    current = datetime.now(tz).replace(second=0, microsecond=0)
-
-    occupied_rows = db_execute(
+    cursor = conn.execute(
         """
-        SELECT scheduled_at
-        FROM queue
-        WHERE user_id = ?
-        AND status = 'queued'
-        """,
-        (user_id,),
-        commit=False,
-    ).fetchall()
-
-    occupied = {
-        row["scheduled_at"]
-        for row in occupied_rows
-    }
-
-    # Ищем ближайший слот в течение года.
-    for day_offset in range(366):
-        day = current + timedelta(days=day_offset)
-
-        if day.weekday() not in config["days"]:
-            continue
-
-        for time_str in config["times"]:
-            h, m = map(int, time_str.split(":"))
-
-            candidate = day.replace(
-                hour=h,
-                minute=m,
-                second=0,
-                microsecond=0,
-            )
-
-            if candidate <= current:
-                continue
-
-            iso = candidate.isoformat()
-
-            if iso not in occupied:
-                return iso
-
-    return None
-
-
-def add_product_to_queue(user_id, draft):
-    slot = next_schedule_slot(user_id)
-
-    if not slot:
-        raise RuntimeError("Не удалось найти свободный слот.")
-
-    cur = db_execute(
-        """
-        INSERT INTO queue (
+        INSERT INTO queue
+        (
             user_id,
-            kind,
-            status,
-            scheduled_at,
-            caption,
-            text_content,
+            channel_id,
+            content_type,
+            text,
             photo1,
             photo2,
+            publish_at,
+            status,
             created_at
         )
-        VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', ?)
         """,
         (
             user_id,
-            "product",
-            slot,
-            draft.get("caption"),
-            None,
-            draft.get("photo1"),
-            draft.get("photo2"),
-            now_iso(),
+            str(channel_id),
+            content_type,
+            text,
+            photo1,
+            photo2,
+            publish_at.isoformat(),
+            datetime.utcnow().isoformat(),
         ),
     )
 
-    return cur.lastrowid
+    conn.commit()
+
+    item_id = cursor.lastrowid
+
+    conn.close()
+
+    return item_id
 
 
-async def schedule_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "⚙️ Настроить",
-                    callback_data="schedule_setup",
-                ),
-                InlineKeyboardButton(
-                    "📋 Очередь",
-                    callback_data="schedule_queue",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "▶️ Включить",
-                    callback_data="schedule_on",
-                ),
-                InlineKeyboardButton(
-                    "⏸ Пауза",
-                    callback_data="schedule_off",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "📢 Подключить канал",
-                    callback_data="connect_channel",
-                ),
-            ],
-        ]
-    )
+async def show_queue(user_id: int, message):
 
-    config = schedule_config(update.effective_user.id)
+    conn = db()
 
-    status = "🟢 Включено" if config["enabled"] else "⚪ Выключено"
-
-    await update.message.reply_text(
-        "⏰ **Расписание публикаций**\n\n"
-        f"Статус: {status}\n"
-        f"Время: {', '.join(config['times'])}\n"
-        f"Дни: {', '.join(str(x + 1) for x in config['days'])}\n"
-        f"Часовой пояс: {config['timezone']}\n\n"
-        "В очередь попадают только одобренные тобой материалы.",
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-    )
-
-
-async def schedule_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state_for(user_id)["mode"] = "schedule_times"
-
-    await update.message.reply_text(
-        "⚙️ Настройка расписания.\n\n"
-        "Шаг 1.\n"
-        "Напиши время публикаций через запятую.\n\n"
-        "Например:\n"
-        "10:00, 15:00, 20:00"
-    )
-
-
-async def handle_schedule_times(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
-
-    if state.get("mode") != "schedule_times":
-        return False
-
-    times = valid_times(update.message.text)
-
-    if not times:
-        await update.message.reply_text(
-            "Не смогла распознать время 😔\n\n"
-            "Напиши, например:\n"
-            "10:00, 15:00, 20:00"
-        )
-        return True
-
-    state["schedule_times"] = times
-    state["mode"] = "schedule_days"
-
-    await update.message.reply_text(
-        "Отлично! 💗\n\n"
-        "Шаг 2.\n"
-        "В какие дни публиковать?\n\n"
-        "Пн=1, Вт=2, Ср=3, Чт=4, Пт=5, Сб=6, Вс=7.\n\n"
-        "Например:\n"
-        "1,2,3,4,5,6,7\n\n"
-        "Или просто:\n"
-        "каждый день"
-    )
-
-    return True
-
-
-async def handle_schedule_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
-
-    if state.get("mode") != "schedule_days":
-        return False
-
-    days = parse_schedule_days(update.message.text)
-
-    if not days:
-        await update.message.reply_text(
-            "Не смогла определить дни 😔"
-        )
-        return True
-
-    times = state.get(
-        "schedule_times",
-        ["10:00", "15:00", "20:00"],
-    )
-
-    db_execute(
-        """
-        UPDATE users
-        SET schedule_days = ?,
-            schedule_times = ?
-        WHERE user_id = ?
-        """,
-        (
-            json.dumps(days),
-            json.dumps(times),
-            user_id,
-        ),
-    )
-
-    state.clear()
-
-    await update.message.reply_text(
-        "✅ Расписание сохранено!\n\n"
-        f"Время: {', '.join(times)}\n"
-        f"Дни: {', '.join(str(x + 1) for x in days)}\n\n"
-        "Теперь одобренные публикации будут автоматически "
-        "раскладываться по этим слотам.",
-        reply_markup=main_menu(),
-    )
-
-    return True
-
-
-async def queue_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    rows = db_execute(
+    rows = conn.execute(
         """
         SELECT *
         FROM queue
         WHERE user_id = ?
-        AND status = 'queued'
-        ORDER BY scheduled_at
+        AND status = 'waiting'
+        ORDER BY publish_at ASC
         LIMIT 20
         """,
         (user_id,),
-        commit=False,
     ).fetchall()
 
+    conn.close()
+
     if not rows:
-        await update.message.reply_text(
+
+        await message.reply_text(
             "📋 Очередь пока пустая."
+        )
+
+        return
+
+    text = "📋 Очередь публикаций:\n\n"
+
+    for i, row in enumerate(rows, 1):
+
+        title = row["text"] or "Без текста"
+
+        title = title.replace("\n", " ")
+
+        text += (
+            f"{i}. {format_dt(row['publish_at'])}\n"
+            f"{shorten(title, 90)}\n\n"
+        )
+
+    await message.reply_text(text)
+
+
+# ============================================================
+# SCHEDULING
+# ============================================================
+
+def get_schedule(user_id: int):
+
+    conn = db()
+
+    row = conn.execute(
+        "SELECT * FROM schedules WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+
+    conn.close()
+
+    if not row:
+        return {
+            "times": ["10:00", "15:00", "20:00"],
+            "days": [1, 2, 3, 4, 5, 6, 7],
+            "timezone": BOT_TIMEZONE,
+        }
+
+    return {
+        "times": json.loads(row["times"]),
+        "days": json.loads(row["days"]),
+        "timezone": row["timezone"] or BOT_TIMEZONE,
+    }
+
+
+async def show_schedule(user_id: int, message):
+
+    schedule = get_schedule(user_id)
+
+    days = schedule["days"]
+
+    day_names = {
+        1: "Пн",
+        2: "Вт",
+        3: "Ср",
+        4: "Чт",
+        5: "Пт",
+        6: "Сб",
+        7: "Вс",
+    }
+
+    days_text = ", ".join(
+        day_names.get(day, str(day))
+        for day in days
+    )
+
+    await message.reply_text(
+        "📅 Расписание\n\n"
+        f"⏰ Время: {', '.join(schedule['times'])}\n"
+        f"📆 Дни: {days_text}\n"
+        f"🌍 Часовой пояс: {schedule['timezone']}\n\n"
+        "Чтобы изменить расписание, напиши:\n\n"
+        "10:00, 15:00, 20:00\n"
+        "каждый день\n\n"
+        "или, например:\n\n"
+        "10:00, 18:00\n"
+        "1,2,3,4,5"
+    )
+
+
+async def save_schedule_from_text(
+    user_id: int,
+    text: str,
+    message,
+):
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    if not lines:
+        await message.reply_text(
+            "Не смогла разобрать расписание."
         )
         return
 
-    lines = ["📋 **Очередь публикаций**\n"]
+    times = re.findall(
+        r"\b([01]?\d|2[0-3]):([0-5]\d)\b",
+        text,
+    )
 
-    for row in rows:
-        title = row["caption"] or row["text_content"] or "Публикация"
+    formatted_times = [
+        f"{int(hour):02d}:{minute}"
+        for hour, minute in times
+    ]
 
-        # Первая строка карточки.
-        first_line = title.splitlines()[0][:80]
+    if not formatted_times:
+        await message.reply_text(
+            "Не нашла время.\n"
+            "Напиши, например: 10:00, 15:00, 20:00"
+        )
+        return
 
-        lines.append(
-            f"#{row['id']} — {row['scheduled_at']}\n"
-            f"{first_line}\n"
+    if "каждый день" in text.lower():
+
+        days = [1, 2, 3, 4, 5, 6, 7]
+
+    else:
+
+        numbers = re.findall(
+            r"\b([1-7])\b",
+            text,
         )
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
+        days = sorted(set(int(x) for x in numbers))
+
+        if not days:
+            days = [1, 2, 3, 4, 5, 6, 7]
+
+    conn = db()
+
+    conn.execute(
+        """
+        INSERT INTO schedules
+        (user_id, times, days, timezone)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            times = excluded.times,
+            days = excluded.days,
+            timezone = excluded.timezone
+        """,
+        (
+            user_id,
+            json.dumps(formatted_times),
+            json.dumps(days),
+            BOT_TIMEZONE,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    await message.reply_text(
+        "✅ Расписание сохранено!\n\n"
+        f"⏰ {', '.join(formatted_times)}\n"
+        f"📆 Дни: {', '.join(map(str, days))}"
+    )
+
+
+def get_next_publish_time(user_id: int):
+
+    schedule = get_schedule(user_id)
+
+    timezone = ZoneInfo(
+        schedule.get("timezone", BOT_TIMEZONE)
+    )
+
+    now = datetime.now(timezone)
+
+    candidates = []
+
+    for offset in range(0, 14):
+
+        date = now.date() + timedelta(days=offset)
+
+        weekday = date.isoweekday()
+
+        if weekday not in schedule["days"]:
+            continue
+
+        for time_str in schedule["times"]:
+
+            hour, minute = map(
+                int,
+                time_str.split(":"),
+            )
+
+            candidate = datetime(
+                date.year,
+                date.month,
+                date.day,
+                hour,
+                minute,
+                tzinfo=timezone,
+            )
+
+            if candidate > now:
+                candidates.append(candidate)
+
+    if not candidates:
+
+        return now + timedelta(hours=1)
+
+    return min(candidates)
+
+
+def format_dt(value):
+
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except Exception:
+            return value
+
+    if value.tzinfo is None:
+        value = value.replace(
+            tzinfo=ZoneInfo(BOT_TIMEZONE)
+        )
+
+    return value.strftime(
+        "%d.%m.%Y в %H:%M"
+    )
+
+
+# ============================================================
+# PUBLISHER
+# ============================================================
+
+async def publish_queue_item(
+    item,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    channel_id = item["channel_id"]
+
+    try:
+
+        # ----------------------------------------------------
+        # TWO PHOTOS
+        # ----------------------------------------------------
+
+        if item["photo1"] and item["photo2"]:
+
+            media = [
+                InputMediaPhoto(
+                    media=item["photo1"],
+                    caption=item["text"],
+                ),
+                InputMediaPhoto(
+                    media=item["photo2"],
+                ),
+            ]
+
+            await context.bot.send_media_group(
+                chat_id=channel_id,
+                media=media,
+            )
+
+        # ----------------------------------------------------
+        # ONE PHOTO
+        # ----------------------------------------------------
+
+        elif item["photo1"]:
+
+            await context.bot.send_photo(
+                chat_id=channel_id,
+                photo=item["photo1"],
+                caption=item["text"],
+            )
+
+        # ----------------------------------------------------
+        # TEXT
+        # ----------------------------------------------------
+
+        else:
+
+            await context.bot.send_message(
+                chat_id=channel_id,
+                text=item["text"],
+            )
+
+        mark_queue_done(item["id"])
+
+        logger.info(
+            "Published queue item %s",
+            item["id"],
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Publication failed for %s: %s",
+            item["id"],
+            e,
+        )
+
+        mark_queue_error(item["id"])
+
+
+def mark_queue_done(item_id: int):
+
+    conn = db()
+
+    conn.execute(
+        """
+        UPDATE queue
+        SET status = 'published'
+        WHERE id = ?
+        """,
+        (item_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def mark_queue_error(item_id: int):
+
+    conn = db()
+
+    conn.execute(
+        """
+        UPDATE queue
+        SET status = 'error'
+        WHERE id = ?
+        """,
+        (item_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+async def publisher_loop():
+
+    while True:
+
+        try:
+
+            now_utc = datetime.utcnow()
+
+            conn = db()
+
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM queue
+                WHERE status = 'waiting'
+                AND publish_at <= ?
+                ORDER BY publish_at ASC
+                LIMIT 10
+                """,
+                (now_utc.isoformat(),),
+            ).fetchall()
+
+            conn.close()
+
+            for row in rows:
+
+                if telegram_app:
+
+                    await publish_queue_item(
+                        row,
+                        telegram_app,
+                    )
+
+        except Exception:
+
+            logger.exception(
+                "Publisher loop error"
+            )
+
+        await asyncio.sleep(30)
+
+
+# ============================================================
+# CONTENT GENERATION
+# ============================================================
+
+async def generate_content_plan(
+    user_id: int,
+    message,
+):
+
+    prompt = """
+Ты — контент-стратег Telegram-канала оригинальной косметики
+и парфюмерии.
+
+Составь контент-план на 7 дней.
+
+Канал:
+- оригинальная косметика;
+- оригинальная парфюмерия;
+- аудитория преимущественно девушки;
+- канал не должен выглядеть каталогом;
+- 70% полезного/интересного;
+- 20% вовлечения;
+- 10% прямых продаж.
+
+Нужно:
+- 1–2 основных поста в день;
+- идеи для коротких сообщений/историй;
+- опросы;
+- полезный контент;
+- немного товаров;
+- мягкие продажи;
+- темы, которыми хочется поделиться.
+
+Пиши конкретные идеи, а не общие слова.
+"""
+
+    result = await ask_openai(
+        prompt,
+        web_search=True,
+    )
+
+    await message.reply_text(
+        "💡 Контент-план на неделю:\n\n" + result
+    )
+
+
+async def generate_ideas(
+    user_id: int,
+    message,
+):
+
+    prompt = """
+Придумай 20 конкретных идей для Telegram-канала
+оригинальной косметики и парфюмерии.
+
+Не делай канал похожим на магазин-каталог.
+
+Раздели идеи на:
+1. Полезное
+2. Вовлечение
+3. Парфюмерия
+4. Косметика
+5. Личные/уютные форматы без необходимости показывать лицо
+6. Мягкие продажи
+7. Идеи для TikTok/Reels
+
+Идеи должны быть современными, живыми и такими,
+которые хочется сохранить или переслать подруге.
+"""
+
+    result = await ask_openai(
+        prompt,
+        web_search=True,
+    )
+
+    await message.reply_text(
+        "💡 Идеи для канала:\n\n" + result
+    )
+
+
+async def create_post(
+    user_id: int,
+    message,
+):
+
+    prompt = """
+Создай один интересный Telegram-пост для канала
+оригинальной косметики и парфюмерии.
+
+Не рекламируй конкретный товар, если он не указан.
+
+Тон:
+- живой;
+- женственный;
+- дружелюбный;
+- не слишком официальный;
+- без ощущения магазина;
+- без фальшивого личного опыта.
+
+Тема:
+«5 ароматов, которые пахнут дороже своей цены»
+
+Не выдумывай факты о конкретных ароматах.
+Если приводишь продукты, используй только подтверждаемую информацию.
+"""
+
+    result = await ask_openai(
+        prompt,
+        web_search=True,
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Одобрить",
+                callback_data="approve_text_post",
+            ),
+            InlineKeyboardButton(
+                "✏️ Изменить",
+                callback_data="edit_text_post",
+            ),
+        ]
+    ])
+
+    await message.reply_text(
+        result,
+        reply_markup=keyboard,
+    )
+
+
+async def create_poll_idea(
+    user_id: int,
+    message,
+):
+
+    prompt = """
+Придумай 5 коротких Telegram-опросов для канала
+косметики и парфюмерии.
+
+Опросы должны быть простыми, интересными и провоцировать
+ответить, а не просто посмотреть.
+
+Формат:
+
+Вопрос
+1. Вариант
+2. Вариант
+3. Вариант
+4. Вариант
+"""
+
+    result = await ask_openai(prompt)
+
+    await message.reply_text(
+        "🗳️ Идеи для опросов:\n\n" + result
     )
 
 
@@ -1495,1089 +2203,156 @@ async def queue_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CHANNEL CONNECTION
 # ============================================================
 
-async def connect_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    state_for(user_id)["mode"] = "connect_channel"
-
-    await update.message.reply_text(
-        "📢 Подключение канала.\n\n"
-        "Добавь этого бота администратором своего Telegram-канала "
-        "с правом публикации сообщений.\n\n"
-        "После этого просто перешли мне сюда любой пост "
-        "из своего канала.\n\n"
-        "Я попробую определить ID канала автоматически."
-    )
-
-
-async def handle_forwarded_channel_post(
+async def handle_forwarded_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
-
-    if state.get("mode") != "connect_channel":
-        return False
 
     message = update.message
 
-    origin = getattr(message, "forward_origin", None)
+    if not message:
+        return
 
-    channel_id = None
-    channel_title = None
-
-    if origin:
-        origin_chat = getattr(origin, "chat", None)
-
-        if origin_chat:
-            channel_id = origin_chat.id
-            channel_title = origin_chat.title
-
-    if not channel_id:
-        await update.message.reply_text(
-            "Не смогла определить канал из этого сообщения 😔\n\n"
-            "Перешли именно пост из канала."
-        )
-        return True
-
-    db_execute(
-        """
-        UPDATE users
-        SET channel_id = ?
-        WHERE user_id = ?
-        """,
-        (str(channel_id), user_id),
+    origin = getattr(
+        message,
+        "forward_origin",
+        None,
     )
 
-    state.clear()
+    if not origin:
+        return
 
-    await update.message.reply_text(
-        "✅ Канал подключён!\n\n"
-        f"📢 {channel_title or 'Канал'}\n"
-        f"ID: {channel_id}\n\n"
-        "Теперь бот сможет публиковать туда "
-        "одобренные тобой материалы по расписанию.",
-        reply_markup=main_menu(),
+    channel = getattr(
+        origin,
+        "chat",
+        None,
     )
 
-    return True
+    if not channel:
+        return
+
+    channel_id = channel.id
+
+    user_id = update.effective_user.id
+
+    set_channel_id(
+        user_id,
+        str(channel_id),
+    )
+
+    await message.reply_text(
+        f"✅ Канал подключён!\n\n"
+        f"Теперь одобренные публикации смогут "
+        f"отправляться в этот канал.\n\n"
+        f"ID: {channel_id}"
+    )
 
 
 # ============================================================
-# CONTENT GENERATION
+# EDIT PRODUCT TEXT
 # ============================================================
 
-async def generate_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_editing_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
     user_id = update.effective_user.id
 
-    state_for(user_id)["mode"] = "post_prompt"
+    state = get_state(user_id)
 
-    await update.message.reply_text(
-        "✍️ Что хочешь опубликовать?\n\n"
-        "Напиши тему.\n\n"
-        "Например:\n"
-        "«5 ароматов, которые пахнут дороже своей цены»\n\n"
-        "или просто:\n"
-        "«пост про уход за кожей»"
+    item_id = state.get(
+        "editing_product_id"
     )
 
-
-async def handle_post_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
-
-    if state.get("mode") != "post_prompt":
+    if not item_id:
         return False
 
-    topic = update.message.text
+    product = get_product(
+        item_id,
+        user_id,
+    )
 
-    await update.message.reply_text(
-        "✍️ Пишу пост..."
+    if not product:
+        return False
+
+    old_caption = build_product_caption(
+        product["data"],
+        product["price"],
+        product["stock"],
     )
 
     prompt = f"""
-Ты ведёшь Telegram-канал оригинальной косметики и парфюмерии.
+Отредактируй карточку товара.
 
-Название канала:
-«Косметика | Парфюм | Москва»
+Текущая карточка:
 
-Стиль:
-живой, женственный, современный, дружелюбный.
-Без ощущения сухого интернет-магазина.
-Без навязчивых продаж.
-Без выдуманных личных историй от лица Ани.
+{old_caption}
 
-Контент должен быть интересным и сохраняемым.
+Пожелание продавца:
 
-Тема:
-{topic}
+{update.message.text}
 
-Напиши готовый Telegram-пост.
-Не используй источники и ссылки.
-Не добавляй фразы вроде «подписывайтесь на канал» без необходимости.
+Сохрани точность информации.
+Не придумывай новые характеристики.
+
+Верни только готовую карточку товара.
 """
-    text = escape_caption(await ai_request(prompt, web=True))
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ В очередь",
-                    callback_data="post_approve",
-                ),
-                InlineKeyboardButton(
-                    "✏️ Изменить",
-                    callback_data="post_edit",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "❌ Отмена",
-                    callback_data="post_cancel",
-                )
-            ],
-        ]
-    )
-
-    state["draft_post"] = text
+    result = await ask_openai(prompt)
 
     await update.message.reply_text(
-        text,
-        reply_markup=keyboard,
-    )
-
-    return True
-
-
-# ============================================================
-# POST CALLBACKS
-# ============================================================
-
-async def handle_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    state = state_for(user_id)
-
-    if query.data == "post_cancel":
-        state.pop("draft_post", None)
-
-        await query.message.reply_text(
-            "❌ Черновик удалён.",
-            reply_markup=main_menu(),
-        )
-        return
-
-    if query.data == "post_edit":
-        state["mode"] = "post_edit"
-
-        await query.message.reply_text(
-            "✏️ Напиши, что изменить в тексте."
-        )
-        return
-
-    if query.data == "post_approve":
-        text_content = state.get("draft_post")
-
-        if not text_content:
-            await query.message.reply_text(
-                "Черновик не найден."
-            )
-            return
-
-        slot = next_schedule_slot(user_id)
-
-        if not slot:
-            await query.message.reply_text(
-                "Не нашла свободный слот расписания."
-            )
-            return
-
-        db_execute(
-            """
-            INSERT INTO queue (
-                user_id,
-                kind,
-                status,
-                scheduled_at,
-                text_content,
-                created_at
-            )
-            VALUES (?, 'post', 'queued', ?, ?, ?)
-            """,
-            (
-                user_id,
-                slot,
-                text_content,
-                now_iso(),
-            ),
-        )
-
-        state.clear()
-
-        await query.message.reply_text(
-            "✅ Пост одобрен и поставлен в очередь!\n\n"
-            f"🕐 Публикация: {slot}",
-            reply_markup=main_menu(),
-        )
-
-
-# ============================================================
-# EDIT PRODUCT
-# ============================================================
-
-async def handle_edit_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
-
-    if state.get("mode") != "edit_product":
-        return False
-
-    text = update.message.text.strip()
-    draft = state.get("draft")
-
-    if not draft:
-        await update.message.reply_text(
-            "Черновик товара не найден."
-        )
-        state.clear()
-        return True
-
-    price, stock = parse_price_stock(text)
-
-    if price:
-        draft["price"] = price
-
-    if stock:
-        draft["stock"] = stock
-
-    lower = text.lower()
-
-    # Категория.
-    for key, tag in CATEGORY_MAP.items():
-        if key in lower or f"#{key}" in lower:
-            draft["category"] = tag
-            break
-
-    # Набор.
-    if "это набор" in lower or "набор" in lower:
-        draft["item_type"] = "set"
-        draft["category"] = "#набор"
-
-    # Объём.
-    volume_match = re.search(
-        r"(\d+(?:[.,]\d+)?)\s*(мл|ml|г|гр|g)",
-        lower,
-    )
-
-    if volume_match:
-        draft["volume"] = (
-            f"{volume_match.group(1)} {volume_match.group(2)}"
-        )
-
-    # Оттенок.
-    shade_match = re.search(
-        r"(?:оттенок|тон|shade)\s*[:\-]?\s*(.+)",
-        text,
-        re.IGNORECASE,
-    )
-
-    if shade_match:
-        draft["shade"] = shade_match.group(1).strip()
-
-    draft["caption"] = build_product_caption(draft)
-
-    state["draft"] = draft
-    state["mode"] = None
-
-    keyboard = InlineKeyboardMarkup(
-        [
+        result,
+        reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
                     "✅ Одобрить",
-                    callback_data="product_approve",
-                ),
-                InlineKeyboardButton(
-                    "✏️ Изменить",
-                    callback_data="product_edit",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔄 Новый товар",
-                    callback_data="product_new",
-                ),
-            ],
-        ]
+                    callback_data=f"approve_product:{item_id}",
+                )
+            ]
+        ]),
     )
 
-    await update.message.reply_text(
-        "Готово, изменила карточку:\n\n"
-        + draft["caption"],
-        reply_markup=keyboard,
+    state.pop(
+        "editing_product_id",
+        None,
     )
 
     return True
 
 
 # ============================================================
-# STORIES
+# COMMANDS
 # ============================================================
 
-async def generate_stories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_menu(update: Update, context):
     await update.message.reply_text(
-        "📱 Придумываю Stories..."
+        "Меню 💗",
+        reply_markup=main_menu(),
     )
 
-    prompt = """
-Придумай 7 коротких идей для Telegram Stories/коротких сообщений
-для канала оригинальной косметики и парфюмерии.
 
-Стиль:
-живой, красивый, женственный.
-Без лица владельца.
-Без выдуманных личных событий.
-
-Смешай:
-- опрос;
-- выбор;
-- полезный совет;
-- продукт;
-- интерактив;
-- закулисье магазина;
-- мягкую продажу.
-
-Формат:
-1.
-2.
-3.
-...
-"""
-
-    result = await ai_request(prompt)
-
-    await update.message.reply_text(result)
-
-
-# ============================================================
-# REELS / TIKTOK
-# ============================================================
-
-async def generate_reels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎬 Придумываю идеи Reels/TikTok..."
+async def cmd_schedule(update: Update, context):
+    await show_schedule(
+        update.effective_user.id,
+        update.message,
     )
 
-    prompt = """
-Придумай 10 идей коротких Reels/TikTok для Telegram-магазина
-оригинальной косметики и парфюмерии.
 
-Владелица не показывает лицо.
-
-Для каждой идеи:
-- hook;
-- что показать;
-- текст на экране;
-- короткий сценарий;
-- CTA.
-
-Идеи должны быть реально снимаемыми на телефон:
-товары, руки, упаковка, распаковка, полка, красивые кадры,
-сравнения, подборки.
-"""
-
-    result = await ai_request(prompt)
-
-    await update.message.reply_text(result)
-
-
-# ============================================================
-# CONTENT PLAN
-# ============================================================
-
-async def content_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📅 Составляю план на неделю..."
+async def cmd_queue(update: Update, context):
+    await show_queue(
+        update.effective_user.id,
+        update.message,
     )
 
-    prompt = """
-Составь недельный контент-план для Telegram-канала
-«Косметика | Парфюм | Москва».
 
-Стратегия:
-70% интересного/полезного,
-20% вовлечения и ощущения присутствия автора,
-10% прямых продаж.
-
-Не превращай канал в каталог.
-
-На каждый день:
-- 1 основной пост;
-- 3 идеи коротких сообщений/Stories.
-
-Используй рубрики:
-#Анисоветует
-#Бьютиразбор
-#Ароматдня
-#ХочуНеМогу
-#Новинки
-#Вналичии
-#Анивыбирает
-#Бьютиопрос
-#Находка
-#Отзывы
-
-Добавляй мягкие продажи.
-"""
-
-    result = await ai_request(prompt)
-
-    await update.message.reply_text(result)
-
-
-# ============================================================
-# POLLS
-# ============================================================
-
-async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    state_for(user_id)["mode"] = "poll"
+async def cmd_channel(update: Update, context):
 
     await update.message.reply_text(
-        "📊 Напиши тему опроса.\n\n"
-        "Например:\n"
-        "«Что выбираете чаще — парфюм или косметику?»"
-    )
-
-
-async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
-
-    if state.get("mode") != "poll":
-        return False
-
-    topic = update.message.text
-
-    prompt = f"""
-Придумай Telegram-опрос для магазина косметики и парфюмерии.
-
-Тема:
-{topic}
-
-Верни JSON:
-{{
-  "question": "...",
-  "options": ["...", "...", "...", "..."]
-}}
-
-Максимум 4 варианта.
-"""
-
-    raw = await ai_request(prompt)
-
-    try:
-        match = re.search(r"\{.*\}", raw, re.S)
-        data = json.loads(match.group(0))
-
-        await update.message.reply_poll(
-            question=data["question"],
-            options=data["options"],
-            is_anonymous=True,
-        )
-
-    except Exception:
-        await update.message.reply_text(
-            "Не получилось создать опрос 😔\n\n"
-            + raw[:1000]
-        )
-
-    state.clear()
-
-    return True
-
-
-# ============================================================
-# ENGAGEMENT / GROWTH
-# ============================================================
-
-async def growth_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = """
-Дай 15 конкретных идей роста Telegram-канала
-оригинальной косметики и парфюмерии.
-
-Основные источники:
-- TikTok;
-- Instagram Reels;
-- Telegram-посевы;
-- взаимопиар;
-- рекомендации;
-- сохранения и пересылки.
-
-Цель:
-не просто много подписчиков, а активная аудитория,
-которая смотрит, отвечает и покупает.
-
-Не предлагай накрутку.
-"""
-
-    result = await ai_request(prompt)
-
-    await update.message.reply_text(result)
-
-
-async def what_to_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = """
-Ты контент-менеджер Telegram-магазина оригинальной косметики
-и парфюмерии.
-
-Предложи 10 идей, что можно опубликовать сегодня,
-если владелица не хочет делать обычный рекламный пост.
-
-Идеи должны быть:
-- интересными;
-- сохраняемыми;
-- вовлекающими;
-- связанными с beauty;
-- без лица;
-- без выдуманных личных историй.
-"""
-
-    result = await ai_request(prompt)
-
-    await update.message.reply_text(result)
-
-
-# ============================================================
-# PUBLISHER
-# ============================================================
-
-async def publish_queue():
-    """
-    Фоновый цикл.
-
-    Публикует только:
-    status='queued'
-    и scheduled_at <= now.
-
-    То есть неподтверждённые материалы никогда сюда
-    не попадают.
-    """
-
-    while True:
-        try:
-            rows = db_execute(
-                """
-                SELECT *
-                FROM queue
-                WHERE status = 'queued'
-                ORDER BY scheduled_at
-                LIMIT 10
-                """,
-                commit=False,
-            ).fetchall()
-
-            for row in rows:
-                user_id = row["user_id"]
-
-                config = schedule_config(user_id)
-
-                if not config["enabled"]:
-                    continue
-
-                channel_id = get_channel_id(user_id)
-
-                if not channel_id:
-                    logger.warning(
-                        "No channel connected for user %s",
-                        user_id,
-                    )
-                    continue
-
-                tz = ZoneInfo(config["timezone"])
-
-                try:
-                    scheduled = datetime.fromisoformat(
-                        row["scheduled_at"]
-                    )
-
-                    if scheduled.tzinfo is None:
-                        scheduled = scheduled.replace(tzinfo=tz)
-
-                    current = datetime.now(tz)
-
-                    if scheduled > current:
-                        continue
-
-                except Exception:
-                    continue
-
-                try:
-                    if row["kind"] == "product":
-                        await publish_product(row, channel_id)
-
-                    elif row["kind"] == "post":
-                        await publish_text_post(row, channel_id)
-
-                    db_execute(
-                        """
-                        UPDATE queue
-                        SET status = 'published',
-                            published_at = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            now_iso(),
-                            row["id"],
-                        ),
-                    )
-
-                    # Сообщаем владельцу.
-                    try:
-                        await bot_app.bot.send_message(
-                            chat_id=user_id,
-                            text=(
-                                "📢 Опубликовано!\n\n"
-                                f"Публикация #{row['id']} "
-                                "вышла в канале."
-                            ),
-                        )
-                    except Exception:
-                        pass
-
-                except Exception as e:
-                    logger.exception(
-                        "Publishing failed for queue item %s",
-                        row["id"],
-                    )
-
-                    # Не удаляем.
-                    # Оставляем в очереди для повторной попытки.
-
-        except Exception:
-            logger.exception("Queue worker error")
-
-        await asyncio.sleep(30)
-
-
-async def publish_product(row, channel_id):
-    photo1 = row["photo1"]
-    photo2 = row["photo2"]
-    caption = row["caption"] or ""
-
-    media = [
-        InputMediaPhoto(
-            media=photo1,
-            caption=caption,
-        ),
-        InputMediaPhoto(
-            media=photo2,
-        ),
-    ]
-
-    await bot_app.bot.send_media_group(
-        chat_id=channel_id,
-        media=media,
-    )
-
-
-async def publish_text_post(row, channel_id):
-    text_content = row["text_content"] or ""
-
-    await bot_app.bot.send_message(
-        chat_id=channel_id,
-        text=text_content,
-    )
-
-
-# ============================================================
-# TEXT ROUTER
-# ============================================================
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    # --------------------------------------------------------
-    # CONNECTED CHANNEL FORWARD
-    # --------------------------------------------------------
-
-    if await handle_forwarded_channel_post(update, context):
-        return
-
-    # --------------------------------------------------------
-    # MAIN BUTTONS
-    # --------------------------------------------------------
-
-    if text == "🛍 Новый товар":
-        await new_product(update, context)
-        return
-
-    if text == "✍️ Новый пост":
-        await generate_post(update, context)
-        return
-
-    if text == "📅 Контент-план":
-        await content_plan(update, context)
-        return
-
-    if text == "⏰ Расписание":
-        await schedule_menu(update, context)
-        return
-
-    if text == "📋 Очередь":
-        await queue_text(update, context)
-        return
-
-    if text == "📊 Идеи продвижения":
-        await growth_ideas(update, context)
-        return
-
-    if text == "🎬 Reels / TikTok":
-        await generate_reels(update, context)
-        return
-
-    if text == "📱 Stories":
-        await generate_stories(update, context)
-        return
-
-    if text == "📊 Опрос":
-        await create_poll(update, context)
-        return
-
-    if text == "💡 Что опубликовать?":
-        await what_to_post(update, context)
-        return
-
-    if text == "⚙️ Настройки":
-        await settings(update, context)
-        return
-
-    # --------------------------------------------------------
-    # STATE ROUTING
-    # --------------------------------------------------------
-
-    state = state_for(user_id)
-
-    if state.get("mode") == "product":
-        await handle_product_text(update, context)
-        return
-
-    if state.get("mode") == "edit_product":
-        await handle_edit_product(update, context)
-        return
-
-    if state.get("mode") == "post_prompt":
-        await handle_post_prompt(update, context)
-        return
-
-    if state.get("mode") == "post_edit":
-        draft = state.get("draft_post")
-
-        if draft:
-            prompt = f"""
-Отредактируй этот Telegram-пост.
-
-Исходный текст:
-{draft}
-
-Пожелание:
-{text}
-
-Верни только готовый текст поста.
-Без ссылок и источников.
-"""
-
-            new_text = escape_caption(await ai_request(prompt))
-
-            state["draft_post"] = new_text
-
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✅ В очередь",
-                            callback_data="post_approve",
-                        ),
-                        InlineKeyboardButton(
-                            "✏️ Изменить",
-                            callback_data="post_edit",
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "❌ Отмена",
-                            callback_data="post_cancel",
-                        )
-                    ],
-                ]
-            )
-
-            state["mode"] = "post_prompt"
-
-            await update.message.reply_text(
-                new_text,
-                reply_markup=keyboard,
-            )
-
-        return
-
-    if state.get("mode") == "schedule_times":
-        await handle_schedule_times(update, context)
-        return
-
-    if state.get("mode") == "schedule_days":
-        await handle_schedule_days(update, context)
-        return
-
-    if state.get("mode") == "poll":
-        await handle_poll(update, context)
-        return
-
-    if state.get("mode") == "connect_channel":
-        await update.message.reply_text(
-            "Для подключения канала нужно именно "
-            "переслать мне пост из канала 📢"
-        )
-        return
-
-    # --------------------------------------------------------
-    # CATEGORY QUICK OVERRIDE
-    # --------------------------------------------------------
-
-    draft = state.get("draft")
-
-    if draft and text.startswith("#"):
-        draft["category"] = normalize_category(text)
-        draft["caption"] = build_product_caption(draft)
-
-        await update.message.reply_text(
-            "Категорию изменила 💗\n\n"
-            + draft["caption"],
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✅ Одобрить",
-                            callback_data="product_approve",
-                        ),
-                        InlineKeyboardButton(
-                            "✏️ Изменить",
-                            callback_data="product_edit",
-                        ),
-                    ]
-                ]
-            ),
-        )
-
-
-# ============================================================
-# PHOTO ROUTER
-# ============================================================
-
-async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = state_for(user_id)
-
-    if state.get("waiting_new_photo"):
-        photo = update.message.photo[-1]
-
-        state["draft"]["photo1"] = photo.file_id
-        state["draft"]["caption"] = build_product_caption(
-            state["draft"]
-        )
-
-        state["waiting_new_photo"] = False
-
-        await update.message.reply_text(
-            "🖼 Фото заменено!\n\n"
-            "Ниже обновлённая карточка."
-        )
-
-        await context.bot.send_photo(
-            chat_id=user_id,
-            photo=photo.file_id,
-            caption=state["draft"]["caption"],
-        )
-
-        await update.message.reply_text(
-            "Проверь карточку:",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✅ Одобрить",
-                            callback_data="product_approve",
-                        ),
-                        InlineKeyboardButton(
-                            "✏️ Изменить",
-                            callback_data="product_edit",
-                        ),
-                    ]
-                ]
-            ),
-        )
-
-        return
-
-    if state.get("mode") == "product":
-        await handle_product_photo(update, context)
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    config = schedule_config(user_id)
-    channel_id = get_channel_id(user_id)
-
-    await update.message.reply_text(
-        "⚙️ **Настройки**\n\n"
-        f"📢 Канал: {channel_id or 'не подключён'}\n"
-        f"🌍 Часовой пояс: {config['timezone']}\n"
-        f"⏰ Расписание: "
-        f"{'включено' if config['enabled'] else 'выключено'}\n\n"
-        "Для изменения расписания открой «⏰ Расписание».",
-        parse_mode="Markdown",
-    )
-
-
-# ============================================================
-# CALLBACK ROUTER
-# ============================================================
-
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.callback_query.data
-
-    if data.startswith("product_"):
-        await callbacks(update, context)
-        return
-
-    if data.startswith("post_"):
-        await handle_post_callback(update, context)
-        return
-
-    if data == "schedule_setup":
-        await update.callback_query.answer()
-
-        user_id = update.callback_query.from_user.id
-        state_for(user_id)["mode"] = "schedule_times"
-
-        await update.callback_query.message.reply_text(
-            "⚙️ Шаг 1.\n\n"
-            "Напиши время публикаций через запятую.\n\n"
-            "Например:\n"
-            "10:00, 15:00, 20:00"
-        )
-        return
-
-    if data == "schedule_queue":
-        await update.callback_query.answer()
-
-        fake_update = update
-        await queue_text_from_callback(fake_update)
-        return
-
-    if data == "schedule_on":
-        await update.callback_query.answer()
-
-        user_id = update.callback_query.from_user.id
-
-        db_execute(
-            """
-            UPDATE users
-            SET schedule_enabled = 1
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        )
-
-        await update.callback_query.message.reply_text(
-            "▶️ Расписание включено!\n\n"
-            "Публиковаться будут только материалы, "
-            "которые ты одобрила."
-        )
-        return
-
-    if data == "schedule_off":
-        await update.callback_query.answer()
-
-        user_id = update.callback_query.from_user.id
-
-        db_execute(
-            """
-            UPDATE users
-            SET schedule_enabled = 0
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        )
-
-        await update.callback_query.message.reply_text(
-            "⏸ Расписание поставлено на паузу.\n\n"
-            "Очередь сохранится."
-        )
-        return
-
-    if data == "connect_channel":
-        await update.callback_query.answer()
-
-        user_id = update.callback_query.from_user.id
-        state_for(user_id)["mode"] = "connect_channel"
-
-        await update.callback_query.message.reply_text(
-            "📢 Добавь меня администратором канала "
-            "с правом публикации.\n\n"
-            "После этого перешли сюда любой пост из канала."
-        )
-        return
-
-
-async def queue_text_from_callback(update):
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    rows = db_execute(
-        """
-        SELECT *
-        FROM queue
-        WHERE user_id = ?
-        AND status = 'queued'
-        ORDER BY scheduled_at
-        LIMIT 20
-        """,
-        (user_id,),
-        commit=False,
-    ).fetchall()
-
-    if not rows:
-        await query.message.reply_text(
-            "📋 Очередь пока пустая."
-        )
-        return
-
-    lines = ["📋 Очередь:\n"]
-
-    for row in rows:
-        title = row["caption"] or row["text_content"] or "Публикация"
-        first_line = title.splitlines()[0][:80]
-
-        lines.append(
-            f"#{row['id']} — {row['scheduled_at']}\n"
-            f"{first_line}\n"
-        )
-
-    await query.message.reply_text(
-        "\n".join(lines)
+        "📢 Чтобы подключить канал:\n\n"
+        "1. Добавь бота администратором.\n"
+        "2. Дай право публиковать сообщения.\n"
+        "3. Перешли мне любое сообщение из канала."
     )
 
 
@@ -2586,92 +2361,161 @@ async def queue_text_from_callback(update):
 # ============================================================
 
 @app.get("/")
-async def health():
+async def root():
     return {
         "status": "ok",
-        "service": "Beauty Manager Bot",
+        "bot": "Beauty Manager",
+    }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
     }
 
 
 # ============================================================
-# TELEGRAM APP
+# TELEGRAM STARTUP
 # ============================================================
 
-bot_app = (
-    Application.builder()
-    .token(BOT_TOKEN)
-    .build()
-)
+async def start_bot():
 
+    global telegram_app
 
-bot_app.add_handler(
-    CommandHandler("start", start)
-)
+    init_db()
 
-bot_app.add_handler(
-    CommandHandler("schedule", schedule_menu)
-)
-
-bot_app.add_handler(
-    CommandHandler("queue", queue_text)
-)
-
-bot_app.add_handler(
-    CallbackQueryHandler(callback_router)
-)
-
-bot_app.add_handler(
-    MessageHandler(
-        filters.PHOTO,
-        photo_router,
+    telegram_app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
     )
-)
 
-bot_app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        text_router,
+    # Commands
+    telegram_app.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
     )
-)
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "menu",
+            cmd_menu,
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "schedule",
+            cmd_schedule,
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "queue",
+            cmd_queue,
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "channel",
+            cmd_channel,
+        )
+    )
+
+    # Callback buttons
+    telegram_app.add_handler(
+        CallbackQueryHandler(
+            callbacks,
+        )
+    )
+
+    # Forwarded channel posts
+    telegram_app.add_handler(
+        MessageHandler(
+            filters.FORWARDED,
+            handle_forwarded_message,
+        ),
+        group=0,
+    )
+
+    # Photos
+    telegram_app.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            handle_product_photo,
+        ),
+        group=1,
+    )
+
+    # Text
+    telegram_app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_text,
+        ),
+        group=2,
+    )
+
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    await telegram_app.updater.start_polling()
+
+    logger.info(
+        "Beauty Manager Telegram bot started"
+    )
+
+    asyncio.create_task(
+        publisher_loop()
+    )
 
 
-scheduler_task = None
+async def stop_bot():
 
+    global telegram_app
+
+    if telegram_app:
+
+        await telegram_app.updater.stop()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+
+        telegram_app = None
+
+
+# ============================================================
+# FASTAPI LIFESPAN
+# ============================================================
 
 @app.on_event("startup")
 async def startup_event():
-    global scheduler_task
 
-    logger.info("Starting Telegram bot...")
-
-    await bot_app.initialize()
-    await bot_app.start()
-
-    await bot_app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
-    scheduler_task = asyncio.create_task(
-        publish_queue()
-    )
-
-    logger.info("Beauty Manager Bot started.")
+    await start_bot()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global scheduler_task
 
-    if scheduler_task:
-        scheduler_task.cancel()
+    await stop_bot()
 
-        try:
-            await scheduler_task
-        except asyncio.CancelledError:
-            pass
 
-    await bot_app.updater.stop()
-    await bot_app.stop()
-    await bot_app.shutdown()
+# ============================================================
+# LOCAL RUN
+# ============================================================
 
-    logger.info("Beauty Manager Bot stopped.")
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(
+            os.getenv("PORT", "8000")
+        ),
+)
