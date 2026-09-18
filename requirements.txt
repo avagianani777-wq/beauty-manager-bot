@@ -1,6 +1,4 @@
-fastapi
-uvicorn
-python-telegram-bot>=22.8
-openai
-httpx
-beautifulsoup4
+python-telegram-bot[job-queue]==22.5
+openai>=1.99.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
