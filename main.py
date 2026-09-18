@@ -1,4 +1,4 @@
-    import os
+import os
 import logging
 
 from fastapi import FastAPI
@@ -14,9 +14,6 @@ from telegram.ext import (
     filters,
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # =========================
 # НАСТРОЙКИ
 # =========================
@@ -26,25 +23,35 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 MODEL = "gpt-5.6-luna"
 
-app = FastAPI()
+# =========================
+# LOGGING
+# =========================
 
-telegram_app = (
-    Application.builder()
-    .token(TELEGRAM_TOKEN)
-    .build()
-    if TELEGRAM_TOKEN
-    else None
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-openai_client = (
-    AsyncOpenAI(api_key=OPENAI_API_KEY)
-    if OPENAI_API_KEY
-    else None
-)
-
+logger = logging.getLogger(__name__)
 
 # =========================
-# AI-ПРОМПТ
+# APP
+# =========================
+
+app = FastAPI()
+
+telegram_app = None
+
+if TELEGRAM_TOKEN:
+    telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+openai_client = None
+
+if OPENAI_API_KEY:
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# =========================
+# AI PROMPT
 # =========================
 
 SYSTEM_PROMPT = """
@@ -52,146 +59,186 @@ SYSTEM_PROMPT = """
 «Косметика | Парфюм | Москва».
 
 Канал продаёт оригинальную косметику, парфюмерию и средства ухода.
-Товары могут быть из США и Европы.
 
-Твоя задача — помогать владельцу канала:
-- писать продающие посты;
-- создавать сторис;
-- придумывать идеи Reels и TikTok;
-- составлять контент-планы;
-- красиво оформлять информацию о товарах;
-- помогать с продвижением канала;
-- придумывать опросы и вовлекающий контент.
+Твоя задача:
+
+— писать продающие посты;
+— создавать серии сторис;
+— придумывать идеи Reels и TikTok;
+— составлять контент-планы;
+— красиво оформлять информацию о товарах;
+— придумывать опросы;
+— помогать с продвижением канала.
 
 СТИЛЬ:
-- современный;
-- красивый;
-- женственный;
-- живой;
-- не слишком официальный;
-- без огромного количества эмодзи;
-- без дешёвого и агрессивного маркетинга;
-- текст должен звучать естественно, будто его написала девушка, которая действительно любит косметику.
 
-ВАЖНО:
-Не выдумывай характеристики товара, которых пользователь не сообщил.
-Не выдумывай наличие товара.
-Не выдумывай скидки.
+Современный, женственный, живой и красивый.
+Не слишком официальный.
+Не используй слишком много эмодзи.
+Не используй агрессивные продажи.
+Текст должен звучать естественно, будто его написала девушка,
+которая действительно любит косметику.
+
+ВАЖНЫЕ ПРАВИЛА:
+
+Не выдумывай характеристики товара.
 Не выдумывай состав.
-Если информации недостаточно — скажи, каких данных не хватает.
+Не выдумывай наличие.
+Не выдумывай скидки.
+Не выдумывай происхождение товара.
 
-Если пользователь даёт название товара, цену и количество,
-используй именно эти данные.
+Используй только информацию, которую сообщил владелец канала.
 
-Если пользователь просит пост — сразу дай готовый текст,
-который можно опубликовать в Telegram.
+Если информации недостаточно, укажи, каких данных не хватает.
 
-Если пользователь просит сторис — сделай последовательность
-из нескольких сторис с коротким текстом для каждой.
+Если пользователь просит пост —
+сразу дай готовый текст для Telegram.
+
+Если пользователь просит сторис —
+сделай несколько отдельных коротких сторис.
 
 Если пользователь просит идеи Reels/TikTok —
-предлагай конкретные идеи: сюжет, первые секунды, текст на экране
-и призыв к действию.
+предлагай конкретные идеи с сюжетом,
+первой фразой, текстом на экране и призывом к действию.
 
 Если пользователь просит контент-план —
-делай его понятным и реалистичным для небольшого Telegram-канала.
+сделай понятный и реалистичный план для небольшого канала.
 
-Не публикуй ничего самостоятельно.
-Ты только готовишь материал для владельца.
+Ничего самостоятельно не публикуй.
+Ты только готовишь материалы для владельца.
 """
 
-
 # =========================
-# ГЛАВНОЕ МЕНЮ
+# KEYBOARD
 # =========================
-
-WELCOME = """
-Привет! 💗
-
-Я Beauty Manager — твой AI-помощник для канала
-«Косметика | Парфюм | Москва».
-
-Теперь я действительно умею работать с AI ✨
-
-Ты можешь:
-📦 добавить товар
-✍️ сделать пост
-📱 сделать сторис
-🎥 придумать Reels/TikTok
-📅 составить план на неделю
-
-Просто выбери действие ниже или напиши мне обычным сообщением.
-"""
-
 
 def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 Добавить товар", callback_data="add")],
-        [InlineKeyboardButton("✍️ Сделать пост", callback_data="post")],
-        [InlineKeyboardButton("📱 Сделать сторис", callback_data="stories")],
-        [InlineKeyboardButton("🎥 Идеи Reels/TikTok", callback_data="reels")],
-        [InlineKeyboardButton("📅 План на неделю", callback_data="plan")],
-    ])
-
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📦 Добавить товар",
+                    callback_data="add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✍️ Сделать пост",
+                    callback_data="post",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📱 Сделать сторис",
+                    callback_data="stories",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🎥 Идеи Reels/TikTok",
+                    callback_data="reels",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📅 План на неделю",
+                    callback_data="plan",
+                )
+            ],
+        ]
+    )
 
 # =========================
 # START
 # =========================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     context.user_data["mode"] = None
 
     await update.message.reply_text(
-        WELCOME,
-        reply_markup=main_keyboard()
+        "Привет! 💗\n\n"
+        "Я Beauty Manager — твой AI-помощник для канала "
+        "«Косметика | Парфюм | Москва».\n\n"
+        "Теперь я могу помогать тебе создавать контент с помощью AI ✨\n\n"
+        "📦 добавлять товары\n"
+        "✍️ создавать посты\n"
+        "📱 делать сторис\n"
+        "🎥 придумывать Reels/TikTok\n"
+        "📅 составлять контент-план\n\n"
+        "Выбери действие ниже или просто напиши мне сообщение.",
+        reply_markup=main_keyboard(),
     )
 
+# =========================
+# HELP
+# =========================
+
+async def help_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "Я могу помочь тебе с:\n\n"
+        "✍️ постами\n"
+        "📱 сторис\n"
+        "🎥 Reels/TikTok\n"
+        "📅 контент-планами\n"
+        "📦 товарами\n\n"
+        "Просто напиши, что тебе нужно 💗"
+    )
 
 # =========================
 # AI
 # =========================
 
-async def ask_ai(user_text: str, mode: str | None = None) -> str:
+async def ask_ai(
+    user_text: str,
+    mode: str | None = None,
+) -> str:
 
     if not openai_client:
         return (
             "⚠️ OpenAI пока не подключён.\n\n"
-            "Проверь, что в Render добавлена переменная "
-            "`OPENAI_API_KEY`."
+            "Проверь переменную OPENAI_API_KEY "
+            "в настройках Render."
         )
 
     mode_instruction = ""
 
-    if mode == "post":
+    if mode == "add":
         mode_instruction = """
-Пользователь хочет создать готовый продающий пост для Telegram.
-Сделай текст полностью готовым к публикации.
+Пользователь добавляет товар.
+Помоги структурировать информацию о нём.
+"""
+
+    elif mode == "post":
+        mode_instruction = """
+Пользователь хочет готовый продающий пост для Telegram.
+Сделай его полностью готовым к публикации.
 """
 
     elif mode == "stories":
         mode_instruction = """
 Пользователь хочет серию сторис.
 Раздели ответ на отдельные сторис.
-Каждая сторис должна быть короткой и понятной.
+Каждая сторис должна быть короткой.
 """
 
     elif mode == "reels":
         mode_instruction = """
-Пользователь хочет идеи для Reels/TikTok.
-Дай несколько конкретных идей с сюжетом и текстом на экране.
+Пользователь хочет идеи Reels или TikTok.
+Предложи несколько конкретных идей.
+Для каждой укажи сюжет, первые секунды,
+текст на экране и призыв к действию.
 """
 
     elif mode == "plan":
         mode_instruction = """
 Пользователь хочет контент-план.
-Сделай структурированный план публикаций на неделю.
-"""
-
-    elif mode == "add":
-        mode_instruction = """
-Пользователь добавляет товар.
-Помоги структурировать информацию о товаре и предложи,
-как лучше использовать его дальше в контенте.
+Сделай структурированный план на неделю.
 """
 
     prompt = f"""
@@ -211,29 +258,31 @@ async def ask_ai(user_text: str, mode: str | None = None) -> str:
 
         return response.output_text
 
-    except Exception as e:
-        logger.exception("OpenAI error")
+    except Exception:
+        logger.exception("OpenAI request failed")
 
         return (
-            "Произошла ошибка при обращении к AI 😔\n\n"
-            f"Техническая информация: {str(e)[:500]}"
+            "Не получилось получить ответ от AI 😔\n\n"
+            "Проверь логи Render — там будет причина ошибки."
         )
 
-
 # =========================
-# КНОПКИ
+# BUTTONS
 # =========================
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
+async def button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
+
     await query.answer()
 
     modes = {
         "add": (
             "add",
-            "📦 Пришли мне название товара, цену и количество. "
-            "Можно также отправить фото."
+            "📦 Пришли название товара, цену и количество.\n\n"
+            "Можно также отправить фотографию товара."
         ),
         "post": (
             "post",
@@ -249,28 +298,30 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
         "plan": (
             "plan",
-            "📅 Пришли список товаров или просто скажи, "
-            "какой контент хочешь продвигать на этой неделе."
+            "📅 Пришли список товаров или напиши, "
+            "что хочешь продвигать на этой неделе."
         ),
     }
 
     mode, message = modes.get(
         query.data,
-        (None, "Готово 💗")
+        (None, "Готово 💗"),
     )
 
     context.user_data["mode"] = mode
 
     await query.message.reply_text(message)
 
-
 # =========================
-# ТЕКСТОВЫЕ СООБЩЕНИЯ
+# TEXT
 # =========================
 
-async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
+async def text_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     text = update.message.text or ""
+
     mode = context.user_data.get("mode")
 
     await update.message.chat.send_action("typing")
@@ -281,17 +332,22 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(answer)
 
-
 # =========================
-# ФОТО
+# PHOTO
 # =========================
 
-async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
+async def photo_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     caption = update.message.caption or ""
+
     mode = context.user_data.get("mode")
 
-    text = caption or "Пользователь отправил фотографию товара."
+    if caption:
+        text = caption
+    else:
+        text = "Пользователь отправил фотографию товара."
 
     await update.message.chat.send_action("typing")
 
@@ -303,32 +359,15 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📸 Фото получила!\n\n" + answer
     )
 
-
 # =========================
-# HELP
-# =========================
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "Я могу помочь тебе с:\n\n"
-        "✍️ постами\n"
-        "📱 сторис\n"
-        "🎥 Reels/TikTok\n"
-        "📅 контент-планами\n"
-        "📦 товарами\n\n"
-        "Просто напиши, что тебе нужно 💗"
-    )
-
-
-# =========================
-# TELEGRAM SETUP
+# SETUP
 # =========================
 
 async def setup():
-
     if not telegram_app:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not set"
+        )
 
     telegram_app.add_handler(
         CommandHandler("start", start)
@@ -343,31 +382,35 @@ async def setup():
     )
 
     telegram_app.add_handler(
-        MessageHandler(filters.PHOTO, photo_message)
+        MessageHandler(
+            filters.PHOTO,
+            photo_message,
+        )
     )
 
     telegram_app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            text_message
+            text_message,
         )
     )
 
     await telegram_app.initialize()
     await telegram_app.start()
 
-
 # =========================
-# STARTUP / SHUTDOWN
+# STARTUP
 # =========================
 
 @app.on_event("startup")
 async def startup():
-
     await setup()
 
     await telegram_app.updater.start_polling()
 
+# =========================
+# SHUTDOWN
+# =========================
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -378,23 +421,19 @@ async def shutdown():
         await telegram_app.stop()
         await telegram_app.shutdown()
 
-
 # =========================
 # HEALTH CHECK
 # =========================
 
 @app.get("/")
 async def root():
-
     return {
         "status": "ok",
-        "service": "beauty-manager-bot"
+        "service": "beauty-manager-bot",
     }
-
 
 @app.get("/health")
 async def health():
-
     return {
-        "status": "healthy"
+        "status": "healthy",
     }
