@@ -1,4 +1,2 @@
-python-telegram-bot==22.5
+python-telegram-bot==22.8
 openai>=1.99.0
-fastapi>=0.115.0
-uvicorn[standard]>=0.34.0
