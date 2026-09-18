@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 python-telegram-bot>=22.0
 openai
+httpx
+beautifulsoup4
