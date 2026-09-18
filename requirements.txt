@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+python-telegram-bot>=22.8
+openai
+httpx
+beautifulsoup4
