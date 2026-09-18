@@ -1,13 +1,13 @@
 import os
 import re
-import io
 import json
-import time
+import io
+import base64
 import sqlite3
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI
 from openai import AsyncOpenAI
@@ -30,68 +30,90 @@ from telegram.ext import (
 
 
 # ============================================================
-# CONFIG
+# НАСТРОЙКИ
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Можно изменить через Render Environment Variables.
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-
-# Канал можно добавить позже.
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-
-# Через сколько секунд после фото начинаем обработку.
-# Это позволяет пользователю успеть написать цену вторым сообщением.
-PHOTO_WAIT_SECONDS = 1.8
-
-# Сколько секунд ждём вторую фотографию.
-SECOND_PHOTO_WAIT_SECONDS = 1.8
-
-DB_PATH = os.getenv("DB_PATH", "beauty_manager.db")
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+# Это реальная модель GPT-5.6 Luna.
+OPENAI_MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "gpt-5.6-luna"
 )
 
-logger = logging.getLogger("beauty_manager")
+DB_PATH = os.getenv(
+    "DB_PATH",
+    "beauty_manager.db"
+)
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    raise RuntimeError(
+        "TELEGRAM_BOT_TOKEN не найден"
+    )
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
+    raise RuntimeError(
+        "OPENAI_API_KEY не найден"
+    )
 
 
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# ============================================================
+# LOGGING
+# ============================================================
 
-app = FastAPI(title="Beauty Manager Bot")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger(
+    "beauty_manager"
+)
+
+
+# ============================================================
+# OPENAI
+# ============================================================
+
+openai_client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY
+)
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI()
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-def db_connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def db():
+    connection = sqlite3.connect(
+        DB_PATH
+    )
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
 def init_database():
-    conn = db_connect()
 
-    conn.execute("""
+    connection = db()
+
+    connection.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            name TEXT,
             brand TEXT,
+            name TEXT,
             category TEXT,
-            description TEXT,
             volume TEXT,
+            shade TEXT,
+            description TEXT,
             price INTEGER,
             stock INTEGER,
             photo1 TEXT,
@@ -102,170 +124,153 @@ def init_database():
         )
     """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            user_id INTEGER PRIMARY KEY,
-            posts_per_day INTEGER DEFAULT 1,
-            times TEXT DEFAULT '12:00',
-            days TEXT DEFAULT '0,1,2,3,4,5,6',
-            timezone TEXT DEFAULT 'Europe/Moscow',
-            paused INTEGER DEFAULT 0
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER,
-            user_id INTEGER,
-            publish_at TEXT,
-            status TEXT DEFAULT 'scheduled',
-            created_at TEXT
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+    connection.commit()
+    connection.close()
 
 
 # ============================================================
-# USER STATE
+# USER STATES
 # ============================================================
 
-# В памяти держим только текущий процесс добавления товара.
-# Самые важные данные продукта сохраняются в SQLite.
 USER_STATE: Dict[int, Dict[str, Any]] = {}
 
-# Задачи ожидания для debounce.
 PROCESS_TASKS: Dict[int, asyncio.Task] = {}
 
 
-def get_state(user_id: int) -> Dict[str, Any]:
+def new_state():
+
+    return {
+        "photos": [],
+        "texts": [],
+        "price": None,
+        "stock": None,
+        "processing": False,
+    }
+
+
+def get_state(user_id: int):
+
     if user_id not in USER_STATE:
-        USER_STATE[user_id] = {
-            "photos": [],
-            "photo_captions": [],
-            "text_parts": [],
-            "price": None,
-            "stock": None,
-            "name_hint": None,
-            "waiting_for": None,
-            "processing": False,
-            "last_activity": time.time(),
-        }
+        USER_STATE[user_id] = new_state()
 
     return USER_STATE[user_id]
 
 
 def reset_state(user_id: int):
-    USER_STATE[user_id] = {
-        "photos": [],
-        "photo_captions": [],
-        "text_parts": [],
-        "price": None,
-        "stock": None,
-        "name_hint": None,
-        "waiting_for": None,
-        "processing": False,
-        "last_activity": time.time(),
-    }
+
+    USER_STATE[user_id] = new_state()
 
 
 # ============================================================
-# PRICE / STOCK PARSER
+# PRICE
 # ============================================================
-
-PRICE_PATTERNS = [
-    r"(?<!\d)(\d{1,3}(?:[\s.,]\d{3})+)\s*(?:₽|руб(?:\.|лей)?|р(?:\.|$))",
-    r"(?<!\d)(\d{3,6})\s*(?:₽|руб(?:\.|лей)?|р(?:\.|$))",
-    r"(?:цена|стоимость)\s*[:\-]?\s*(\d{3,6})",
-]
-
-STOCK_PATTERNS = [
-    r"(?:в наличии|наличие)\s*[:\-]?\s*(\d+)",
-    r"(\d+)\s*(?:шт|штук)",
-]
-
 
 def parse_price(text: str) -> Optional[int]:
+
     if not text:
         return None
 
-    text_lower = text.lower().replace("\u00a0", " ")
+    text = text.lower()
+    text = text.replace("\u00a0", " ")
 
-    for pattern in PRICE_PATTERNS:
-        match = re.search(pattern, text_lower, re.IGNORECASE)
+    patterns = [
 
-        if match:
-            raw = match.group(1)
+        # 3 500 ₽
+        r"(?<!\d)(\d{1,3}(?:\s\d{3})+)\s*(?:₽|руб|рублей|р\b)",
 
-            raw = raw.replace(" ", "")
-            raw = raw.replace(".", "")
-            raw = raw.replace(",", "")
+        # 3500 ₽
+        r"(?<!\d)(\d{3,6})\s*(?:₽|руб|рублей|р\b)",
 
-            try:
-                value = int(raw)
+        # цена 3500
+        r"(?:цена|стоимость)\s*[:\-]?\s*(\d{3,6})",
+    ]
 
-                # Защита от случайного распознавания номера оттенка,
-                # года и т.п.
-                if 100 <= value <= 999999:
-                    return value
-            except ValueError:
-                pass
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if not match:
+            continue
+
+        value = match.group(1)
+
+        value = (
+            value
+            .replace(" ", "")
+            .replace(".", "")
+            .replace(",", "")
+        )
+
+        try:
+
+            value = int(value)
+
+            if 100 <= value <= 999999:
+                return value
+
+        except ValueError:
+            pass
 
     return None
 
+
+# ============================================================
+# STOCK
+# ============================================================
 
 def parse_stock(text: str) -> Optional[int]:
+
     if not text:
         return None
 
-    text_lower = text.lower()
+    patterns = [
 
-    for pattern in STOCK_PATTERNS:
-        match = re.search(pattern, text_lower, re.IGNORECASE)
+        r"(?:в наличии|наличие)\s*[:\-]?\s*(\d+)",
+
+        r"(\d+)\s*(?:шт|штук)",
+
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text.lower()
+        )
 
         if match:
+
             try:
-                return int(match.group(1))
+                return int(
+                    match.group(1)
+                )
             except ValueError:
                 pass
 
     return None
-
-
-def remove_price_stock(text: str) -> str:
-    if not text:
-        return ""
-
-    result = text
-
-    for pattern in PRICE_PATTERNS:
-        result = re.sub(pattern, "", result, flags=re.IGNORECASE)
-
-    for pattern in STOCK_PATTERNS:
-        result = re.sub(pattern, "", result, flags=re.IGNORECASE)
-
-    return result.strip(" ,.-\n")
 
 
 # ============================================================
 # CATEGORY
 # ============================================================
 
-CATEGORY_HASHTAGS = {
+CATEGORY_MAP = {
+
     "парфюм": "#парфюм",
     "парфюмерия": "#парфюм",
     "духи": "#парфюм",
     "аромат": "#парфюм",
 
     "тональный крем": "#тональный_крем",
-    "тон": "#тональный_крем",
     "тональная основа": "#тональный_крем",
+    "тон": "#тональный_крем",
     "foundation": "#тональный_крем",
 
     "консилер": "#консилер",
-    "корректор": "#консилер",
 
     "румяна": "#румяна",
     "blush": "#румяна",
@@ -278,7 +283,6 @@ CATEGORY_HASHTAGS = {
     "powder": "#пудра",
 
     "тени": "#тени",
-    "палетка теней": "#тени",
     "eyeshadow": "#тени",
 
     "тушь": "#тушь",
@@ -287,48 +291,54 @@ CATEGORY_HASHTAGS = {
     "помада": "#помада",
     "lipstick": "#помада",
 
-    "блеск для губ": "#блеск_для_губ",
     "блеск": "#блеск_для_губ",
     "lip gloss": "#блеск_для_губ",
 
     "карандаш для губ": "#карандаш_для_губ",
-    "карандаш": "#карандаш",
 
     "крем": "#крем",
-    "крем для лица": "#крем_для_лица",
 
     "сыворотка": "#сыворотка",
 
     "маска": "#маска",
 
-    "очищение": "#очищение",
-    "очищающее средство": "#очищение",
-
     "шампунь": "#шампунь",
+
     "кондиционер": "#кондиционер",
 
     "набор": "#набор",
     "комплект": "#набор",
 
     "уход": "#уход",
-    "косметика": "#косметика",
 }
 
 
-def normalize_category(category: str) -> str:
+def category_hashtag(
+    category: str
+) -> str:
+
     if not category:
         return "#косметика"
 
-    clean = category.strip().lower()
+    category = category.lower().strip()
 
-    if clean.startswith("#"):
-        return clean.replace(" ", "_")
+    if category.startswith("#"):
+        return category.replace(
+            " ",
+            "_"
+        )
 
-    for key, hashtag in CATEGORY_HASHTAGS.items():
-        if key in clean:
+    for key, hashtag in CATEGORY_MAP.items():
+
+        if key in category:
             return hashtag
 
-    clean = re.sub(r"[^а-яa-z0-9]+", "_", clean)
+    clean = re.sub(
+        r"[^а-яa-z0-9]+",
+        "_",
+        category
+    )
+
     clean = clean.strip("_")
 
     if not clean:
@@ -338,448 +348,369 @@ def normalize_category(category: str) -> str:
 
 
 # ============================================================
-# TEXT CLEANING
+# TELEGRAM FILE
 # ============================================================
 
-def clean_ai_text(text: str) -> str:
-    if not text:
-        return ""
-
-    text = text.strip()
-
-    # Убираем markdown-ссылки.
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-
-    # Убираем обычные URL.
-    text = re.sub(r"https?://\S+", "", text)
-
-    # Убираем строки с источниками.
-    lines = []
-
-    for line in text.splitlines():
-        low = line.lower().strip()
-
-        if (
-            low.startswith("источник")
-            or low.startswith("sources")
-            or low.startswith("source")
-            or "http://" in low
-            or "https://" in low
-        ):
-            continue
-
-        lines.append(line)
-
-    text = "\n".join(lines)
-
-    # Слишком много пустых строк.
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
-
-
-def limit_caption(text: str, limit: int = 1000) -> str:
-    text = clean_ai_text(text)
-
-    if len(text) <= limit:
-        return text
-
-    return text[:limit - 3].rstrip() + "..."
-
-
-# ============================================================
-# TELEGRAM PHOTO -> BYTES
-# ============================================================
-
-async def telegram_photo_to_bytes(
+async def download_telegram_photo(
     bot,
     file_id: str
 ) -> bytes:
 
-    telegram_file = await bot.get_file(file_id)
+    telegram_file = await bot.get_file(
+        file_id
+    )
 
     buffer = io.BytesIO()
 
-    await telegram_file.download_to_memory(buffer)
+    await telegram_file.download_to_memory(
+        buffer
+    )
 
     return buffer.getvalue()
 
 
-def bytes_to_data_url(image_bytes: bytes) -> str:
-    import base64
+# ============================================================
+# IMAGE -> DATA URL
+# ============================================================
 
-    encoded = base64.b64encode(image_bytes).decode("utf-8")
+def image_to_data_url(
+    image_bytes: bytes
+) -> str:
 
-    return f"data:image/jpeg;base64,{encoded}"
+    encoded = base64.b64encode(
+        image_bytes
+    ).decode("utf-8")
+
+    return (
+        "data:image/jpeg;base64,"
+        + encoded
+    )
 
 
 # ============================================================
-# OPENAI PRODUCT RECOGNITION
+# РАСПОЗНАВАНИЕ ТОВАРА
 # ============================================================
-
-PRODUCT_SYSTEM_PROMPT = """
-Ты — ассистент магазина оригинальной косметики и парфюмерии.
-
-Твоя задача:
-1. Определить товар по фотографии максимально точно.
-2. Прочитать надписи на упаковке.
-3. Если название бренда/товара видно не полностью — не выдумывать.
-4. Использовать веб-поиск только для проверки найденного товара.
-5. Если товар найден уверенно, проверить официальную информацию.
-6. Не путать оттенок, объём, концентрацию или версию продукта.
-7. Не использовать цену из интернета как цену продавца.
-8. Не использовать наличие из интернета.
-9. Цена и наличие продавца будут переданы отдельно.
-
-Особенно важно:
-- сначала анализируй саму фотографию;
-- не называй случайный похожий товар;
-- если есть сомнение, укажи confidence ниже;
-- описание должно быть коротким и пригодным для Telegram.
-
-Верни ТОЛЬКО валидный JSON без markdown.
-
-Формат:
-
-{
-  "brand": "...",
-  "name": "...",
-  "category": "...",
-  "volume": "...",
-  "shade": "...",
-  "item_type": "single|set",
-  "description": "...",
-  "confidence": 0.0,
-  "verified": true,
-  "notes": "..."
-}
-
-category должна быть обычным названием категории:
-например:
-"парфюм"
-"тональный крем"
-"румяна"
-"бронзер"
-"пудра"
-"тени"
-"тушь"
-"помада"
-"крем"
-"сыворотка"
-"набор"
-
-Не добавляй # к category.
-"""
-
 
 async def recognize_product(
     image_bytes: bytes,
-    user_hint: str = "",
-) -> Dict[str, Any]:
+    additional_text: str = ""
+):
 
-    image_data_url = bytes_to_data_url(image_bytes)
+    image_url = image_to_data_url(
+        image_bytes
+    )
 
-    user_text = """
-Определи товар на изображении.
+    prompt = f"""
+Ты профессиональный ассистент магазина
+оригинальной косметики и парфюмерии.
 
-Информация от продавца:
-%s
+Твоя задача — ПО ФОТОГРАФИИ определить
+конкретный товар.
 
-Если в этой информации есть цена или наличие, НЕ используй их для определения товара.
-""" % (user_hint or "нет дополнительной информации")
+Очень внимательно прочитай:
+- название бренда;
+- название продукта;
+- надписи на упаковке;
+- объём;
+- оттенок;
+- тип продукта.
+
+Если товар можно определить точно —
+назови его точно.
+
+НЕ выдумывай товар.
+
+Если на фотографии видно только часть названия,
+используй визуальные признаки и известную информацию
+о продукте, но не придумывай случайный бренд.
+
+Дополнительный текст от продавца:
+{additional_text or "нет"}
+
+Верни ТОЛЬКО JSON.
+Никаких пояснений до или после JSON.
+
+Формат:
+
+{{
+    "brand": "бренд",
+    "name": "полное название товара",
+    "category": "категория",
+    "volume": "объём",
+    "shade": "оттенок или пусто",
+    "description": "короткое точное описание товара",
+    "confidence": 0.0
+}}
+
+confidence:
+1.0 = товар определён практически точно
+0.8 = высокая уверенность
+0.6 = вероятно
+0.4 = есть сомнения
+0.2 = определить почти невозможно
+
+Категория должна быть простой:
+парфюм
+тональный крем
+консилер
+румяна
+бронзер
+пудра
+тени
+тушь
+помада
+блеск для губ
+крем
+сыворотка
+маска
+шампунь
+кондиционер
+набор
+косметика
+"""
 
     try:
+
         response = await openai_client.responses.create(
+
             model=OPENAI_MODEL,
+
             input=[
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": PRODUCT_SYSTEM_PROMPT,
-                        }
-                    ],
-                },
+
                 {
                     "role": "user",
+
                     "content": [
+
                         {
                             "type": "input_text",
-                            "text": user_text,
+                            "text": prompt,
                         },
+
                         {
                             "type": "input_image",
-                            "image_url": image_data_url,
-                            "detail": "auto",
+                            "image_url": image_url,
+                            "detail": "high",
                         },
+
                     ],
-                },
+                }
+
             ],
-            max_output_tokens=700,
+
+            max_output_tokens=500,
+
         )
 
-        raw = response.output_text.strip()
+        result = (
+            response.output_text
+            .strip()
+        )
 
-        # Если модель вдруг обернула JSON в ```json
-        raw = re.sub(r"^```json\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+        # Убираем ```json
+        result = re.sub(
+            r"^```json\s*",
+            "",
+            result
+        )
 
-        data = json.loads(raw)
+        result = re.sub(
+            r"\s*```$",
+            "",
+            result
+        )
+
+        data = json.loads(
+            result
+        )
 
         return data
 
-    except Exception as e:
-        logger.exception("Product recognition error: %s", e)
+    except Exception as error:
 
-        return {
-            "brand": "",
-            "name": "",
-            "category": "косметика",
-            "volume": "",
-            "shade": "",
-            "item_type": "single",
-            "description": "",
-            "confidence": 0,
-            "verified": False,
-            "notes": str(e),
-        }
-
-
-# ============================================================
-# WEB VERIFICATION
-# ============================================================
-
-async def verify_product_with_web(
-    product: Dict[str, Any]
-) -> Dict[str, Any]:
-
-    name = product.get("name", "")
-    brand = product.get("brand", "")
-
-    if not name:
-        return product
-
-    query = f"""
-Проверь информацию о косметическом/парфюмерном товаре:
-{brand} {name}
-
-Нужно проверить:
-- точное название;
-- бренд;
-- категорию;
-- объём;
-- назначение;
-- основные характеристики.
-
-Предпочитай официальный сайт бренда.
-Если официального сайта нет, используй крупного надёжного продавца.
-
-Не меняй товар на похожий.
-Не указывай цену продавца.
-Не указывай наличие.
-"""
-
-    try:
-        response = await openai_client.responses.create(
-            model=OPENAI_MODEL,
-            tools=[
-                {
-                    "type": "web_search",
-                    "search_context_size": "low",
-                }
-            ],
-            input=query,
-            max_output_tokens=600,
+        logger.exception(
+            "OPENAI RECOGNITION ERROR: %s",
+            error
         )
 
-        text = response.output_text.strip()
-
-        # Просим модель аккуратно применить проверку к имеющемуся объекту.
-        merge_prompt = f"""
-Ниже данные, полученные с фотографии:
-
-{json.dumps(product, ensure_ascii=False)}
-
-Ниже результаты проверки:
-
-{text}
-
-Верни ТОЛЬКО JSON:
-
-{{
-  "brand": "...",
-  "name": "...",
-  "category": "...",
-  "volume": "...",
-  "shade": "...",
-  "description": "...",
-  "confidence": 0.0
-}}
-
-Если веб-результат не подтверждает товар, сохрани данные фотографии.
-Не меняй товар на похожий.
-Не добавляй цену или наличие.
-"""
-
-        merged = await openai_client.responses.create(
-            model=OPENAI_MODEL,
-            input=merge_prompt,
-            max_output_tokens=500,
-        )
-
-        raw = merged.output_text.strip()
-
-        raw = re.sub(r"^```json\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-
-        verified = json.loads(raw)
-
-        product.update({
-            "brand": verified.get("brand") or product.get("brand", ""),
-            "name": verified.get("name") or product.get("name", ""),
-            "category": verified.get("category") or product.get("category", ""),
-            "volume": verified.get("volume") or product.get("volume", ""),
-            "shade": verified.get("shade") or product.get("shade", ""),
-            "description": verified.get("description") or product.get("description", ""),
-            "confidence": verified.get(
-                "confidence",
-                product.get("confidence", 0)
-            ),
-        })
-
-    except Exception as e:
-        logger.warning("Web verification failed: %s", e)
-
-    return product
+        return None
 
 
 # ============================================================
-# PRODUCT CAPTION
+# CLEAN DESCRIPTION
+# ============================================================
+
+def clean_text(text: str) -> str:
+
+    if not text:
+        return ""
+
+    text = re.sub(
+        r"https?://\S+",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text
+    )
+
+    return text.strip()
+
+
+# ============================================================
+# CAPTION
 # ============================================================
 
 def build_caption(
-    product: Dict[str, Any],
+    product: dict,
     price: int,
-    stock: int,
-) -> str:
+    stock: int
+):
 
-    brand = product.get("brand", "").strip()
-    name = product.get("name", "").strip()
-
-    category = normalize_category(
-        product.get("category", "косметика")
+    hashtag = category_hashtag(
+        product.get(
+            "category",
+            "косметика"
+        )
     )
 
-    description = clean_ai_text(
-        product.get("description", "")
+    brand = (
+        product.get("brand")
+        or ""
+    ).strip()
+
+    name = (
+        product.get("name")
+        or ""
+    ).strip()
+
+    volume = (
+        product.get("volume")
+        or ""
+    ).strip()
+
+    shade = (
+        product.get("shade")
+        or ""
+    ).strip()
+
+    description = clean_text(
+        product.get(
+            "description",
+            ""
+        )
     )
 
-    volume = product.get("volume", "").strip()
-    shade = product.get("shade", "").strip()
+    if brand and name:
 
-    title_parts = []
+        title = (
+            f"{brand} {name}"
+        )
 
-    if brand:
-        title_parts.append(brand)
+    elif name:
 
-    if name and name.lower() not in brand.lower():
-        title_parts.append(name)
+        title = name
 
-    title = " ".join(title_parts).strip()
+    elif brand:
 
-    if not title:
+        title = brand
+
+    else:
+
         title = "Товар"
 
     lines = [
-        category,
+
+        hashtag,
+
         "",
+
         f"✨ {title}",
+
     ]
 
     if description:
+
         lines.extend([
             "",
-            description,
+            description
         ])
 
-    extra = []
+    details = []
 
     if volume:
-        extra.append(f"Объём: {volume}")
+        details.append(
+            f"Объём: {volume}"
+        )
 
     if shade:
-        extra.append(f"Оттенок: {shade}")
+        details.append(
+            f"Оттенок: {shade}"
+        )
 
-    if extra:
+    if details:
+
         lines.extend([
             "",
-            " • ".join(extra),
+            " • ".join(details)
         ])
 
     lines.extend([
+
         "",
-        f"💰 Цена: {price:,} ₽".replace(",", " "),
+
+        f"💰 Цена: {price:,} ₽"
+        .replace(",", " "),
+
         f"📦 В наличии: {stock} шт.",
+
     ])
 
-    return limit_caption("\n".join(lines))
+    caption = "\n".join(
+        lines
+    )
+
+    # Telegram допускает до 1024 символов
+    # в caption фотографии.
+    if len(caption) > 1000:
+
+        caption = (
+            caption[:997]
+            + "..."
+        )
+
+    return caption
 
 
 # ============================================================
-# APPROVAL KEYBOARD
-# ============================================================
-
-def approval_keyboard(product_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ Одобрить",
-                callback_data=f"approve:{product_id}",
-            ),
-            InlineKeyboardButton(
-                "✏️ Изменить",
-                callback_data=f"edit:{product_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🖼️ Другое фото",
-                callback_data=f"photo:{product_id}",
-            ),
-            InlineKeyboardButton(
-                "❌ Удалить",
-                callback_data=f"cancel:{product_id}",
-            ),
-        ],
-    ])
-
-
-# ============================================================
-# SAVE PRODUCT
+# SAVE
 # ============================================================
 
 def save_product(
     user_id: int,
-    product: Dict[str, Any],
+    product: dict,
     price: int,
     stock: int,
-    photo1: Optional[str],
+    photo1: str,
     photo2: Optional[str],
-    caption: str,
-) -> int:
+    caption: str
+):
 
-    conn = db_connect()
+    connection = db()
 
-    cursor = conn.execute(
+    cursor = connection.execute(
         """
         INSERT INTO products (
             user_id,
-            name,
             brand,
+            name,
             category,
-            description,
             volume,
+            shade,
+            description,
             price,
             stock,
             photo1,
@@ -788,44 +719,135 @@ def save_product(
             status,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
+
         (
             user_id,
-            product.get("name", ""),
-            product.get("brand", ""),
-            normalize_category(product.get("category", "")),
-            product.get("description", ""),
-            product.get("volume", ""),
+
+            product.get(
+                "brand",
+                ""
+            ),
+
+            product.get(
+                "name",
+                ""
+            ),
+
+            category_hashtag(
+                product.get(
+                    "category",
+                    ""
+                )
+            ),
+
+            product.get(
+                "volume",
+                ""
+            ),
+
+            product.get(
+                "shade",
+                ""
+            ),
+
+            product.get(
+                "description",
+                ""
+            ),
+
             price,
+
             stock,
+
             photo1,
+
             photo2,
+
             caption,
+
             "draft",
-            datetime.now(timezone.utc).isoformat(),
-        ),
+
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+        )
     )
 
-    product_id = cursor.lastrowid
+    product_id = (
+        cursor.lastrowid
+    )
 
-    conn.commit()
-    conn.close()
+    connection.commit()
+    connection.close()
 
     return product_id
+
+
+# ============================================================
+# BUTTONS
+# ============================================================
+
+def product_keyboard(
+    product_id: int
+):
+
+    return InlineKeyboardMarkup([
+
+        [
+
+            InlineKeyboardButton(
+                "✅ Одобрить",
+                callback_data=(
+                    f"approve:{product_id}"
+                )
+            ),
+
+            InlineKeyboardButton(
+                "✏️ Изменить",
+                callback_data=(
+                    f"edit:{product_id}"
+                )
+            ),
+
+        ],
+
+        [
+
+            InlineKeyboardButton(
+                "🖼 Другое фото",
+                callback_data=(
+                    f"photo:{product_id}"
+                )
+            ),
+
+            InlineKeyboardButton(
+                "❌ Удалить",
+                callback_data=(
+                    f"delete:{product_id}"
+                )
+            ),
+
+        ],
+
+    ])
 
 
 # ============================================================
 # PROCESS PRODUCT
 # ============================================================
 
-async def process_current_product(
+async def process_product(
     user_id: int,
     chat_id: int,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    state = get_state(user_id)
+    state = get_state(
+        user_id
+    )
 
     if state["processing"]:
         return
@@ -833,8 +855,6 @@ async def process_current_product(
     state["processing"] = True
 
     try:
-        # Даём возможность последнему сообщению попасть в state.
-        await asyncio.sleep(0.1)
 
         photos = state["photos"]
 
@@ -842,337 +862,414 @@ async def process_current_product(
             state["processing"] = False
             return
 
-        price = state.get("price")
-        stock = state.get("stock")
+        price = state["price"]
 
         # ----------------------------------------------------
-        # PRICE
+        # ЦЕНА НЕ НАЙДЕНА
         # ----------------------------------------------------
 
         if price is None:
+
             state["processing"] = False
-            state["waiting_for"] = "price"
 
             await context.bot.send_message(
+
                 chat_id=chat_id,
+
                 text=(
-                    "💰 Я получила фотографию, но не нашла цену.\n\n"
-                    "Напиши, например:\n"
-                    "3500 ₽\n\n"
-                    "или:\n"
-                    "3500 ₽, в наличии 2 шт."
-                ),
+                    "💰 Фото получила ❤️\n\n"
+                    "Теперь напиши цену товара.\n\n"
+                    "Например: 3500 ₽"
+                )
+
             )
 
             return
 
-        # ----------------------------------------------------
-        # STOCK
-        # ----------------------------------------------------
-
-        if stock is None:
-            stock = 1
+        stock = (
+            state["stock"]
+            or 1
+        )
 
         # ----------------------------------------------------
-        # SHOW PROCESSING
+        # АНИМАЦИЯ
         # ----------------------------------------------------
 
         await context.bot.send_chat_action(
             chat_id=chat_id,
-            action="typing",
+            action="typing"
         )
 
         # ----------------------------------------------------
-        # GET FIRST IMAGE
+        # СКАЧИВАЕМ ФОТО
         # ----------------------------------------------------
 
-        first_photo = photos[0]
-
-        image_bytes = await telegram_photo_to_bytes(
-            context.bot,
-            first_photo,
-        )
-
-        # ----------------------------------------------------
-        # RECOGNITION
-        # ----------------------------------------------------
-
-        user_text = " ".join(
-            state.get("text_parts", [])
-        ).strip()
-
-        recognition = await recognize_product(
-            image_bytes=image_bytes,
-            user_hint=user_text,
-        )
-
-        # ----------------------------------------------------
-        # OPTIONAL WEB CHECK
-        # ----------------------------------------------------
-
-        confidence = float(
-            recognition.get("confidence", 0) or 0
-        )
-
-        if recognition.get("name") and confidence >= 0.55:
-            recognition = await verify_product_with_web(
-                recognition
+        image_bytes = (
+            await download_telegram_photo(
+                context.bot,
+                photos[0]
             )
+        )
 
         # ----------------------------------------------------
-        # IF PRODUCT NOT RECOGNIZED
+        # РАСПОЗНАЁМ
         # ----------------------------------------------------
 
-        name = recognition.get("name", "").strip()
+        additional_text = "\n".join(
+            state["texts"]
+        )
 
-        if not name:
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "😕 Я не смогла уверенно определить товар по фото.\n\n"
-                    "Попробуй прислать фотографию, где хорошо видно "
-                    "название бренда и продукта."
-                ),
+        product = (
+            await recognize_product(
+                image_bytes,
+                additional_text
             )
+        )
+
+        # ----------------------------------------------------
+        # ЕСЛИ НЕ УДАЛОСЬ
+        # ----------------------------------------------------
+
+        if not product:
 
             state["processing"] = False
+
+            await context.bot.send_message(
+
+                chat_id=chat_id,
+
+                text=(
+                    "😔 Я не смогла прочитать товар "
+                    "на фотографии.\n\n"
+                    "Попробуй отправить фото крупнее, "
+                    "чтобы было хорошо видно название "
+                    "бренда и продукта."
+                )
+
+            )
+
+            return
+
+        brand = (
+            product.get(
+                "brand",
+                ""
+            )
+            or ""
+        ).strip()
+
+        name = (
+            product.get(
+                "name",
+                ""
+            )
+            or ""
+        ).strip()
+
+        confidence = float(
+            product.get(
+                "confidence",
+                0
+            )
+            or 0
+        )
+
+        # ----------------------------------------------------
+        # ПРОВЕРКА
+        # ----------------------------------------------------
+
+        if not brand and not name:
+
+            state["processing"] = False
+
+            await context.bot.send_message(
+
+                chat_id=chat_id,
+
+                text=(
+                    "😔 Не получилось определить "
+                    "название товара.\n\n"
+                    "Пришли, пожалуйста, более чёткое "
+                    "фото лицевой стороны упаковки."
+                )
+
+            )
+
             return
 
         # ----------------------------------------------------
-        # CATEGORY
+        # ЕСЛИ НИЗКАЯ УВЕРЕННОСТЬ
         # ----------------------------------------------------
 
-        recognition["category"] = normalize_category(
-            recognition.get("category", "")
-        )
+        if confidence < 0.45:
 
-        # ----------------------------------------------------
-        # DESCRIPTION FALLBACK
-        # ----------------------------------------------------
+            warning = (
+                "\n\n⚠️ Уверенность распознавания "
+                "невысокая — пожалуйста, проверь "
+                "название перед одобрением."
+            )
 
-        if not recognition.get("description"):
-            recognition["description"] = (
-                f"{recognition.get('brand', '')} "
-                f"{recognition.get('name', '')}"
-            ).strip()
+        else:
 
-        # ----------------------------------------------------
-        # PHOTOS
-        # ----------------------------------------------------
-
-        photo1 = photos[0]
-
-        photo2 = None
-
-        if len(photos) >= 2:
-            photo2 = photos[1]
+            warning = ""
 
         # ----------------------------------------------------
         # CAPTION
         # ----------------------------------------------------
 
         caption = build_caption(
-            recognition,
+            product,
             price,
-            stock,
+            stock
         )
 
         # ----------------------------------------------------
-        # SAVE
+        # Сохраняем
         # ----------------------------------------------------
+
+        photo1 = photos[0]
+
+        photo2 = (
+            photos[1]
+            if len(photos) >= 2
+            else None
+        )
 
         product_id = save_product(
+
             user_id=user_id,
-            product=recognition,
+
+            product=product,
+
             price=price,
+
             stock=stock,
+
             photo1=photo1,
+
             photo2=photo2,
-            caption=caption,
+
+            caption=caption
+
+        )
+
+        keyboard = product_keyboard(
+            product_id
         )
 
         # ----------------------------------------------------
-        # SEND RESULT
+        # ОТПРАВЛЯЕМ
         # ----------------------------------------------------
 
-        keyboard = approval_keyboard(product_id)
-
         if photo2:
-            # Telegram albums позволяют отправить несколько фото.
-            # Caption ставим на первое фото.
+
             media = [
+
                 InputMediaPhoto(
                     media=photo1,
-                    caption=caption,
+                    caption=caption
                 ),
+
                 InputMediaPhoto(
-                    media=photo2,
+                    media=photo2
                 ),
+
             ]
 
             await context.bot.send_media_group(
+
                 chat_id=chat_id,
-                media=media,
+
+                media=media
+
             )
 
             await context.bot.send_message(
+
                 chat_id=chat_id,
-                text="Проверь карточку товара 👆",
-                reply_markup=keyboard,
+
+                text=(
+                    "Проверь карточку товара 👆"
+                    + warning
+                ),
+
+                reply_markup=keyboard
+
             )
 
         else:
+
             await context.bot.send_photo(
+
                 chat_id=chat_id,
+
                 photo=photo1,
+
                 caption=caption,
-                reply_markup=keyboard,
+
+                reply_markup=keyboard
+
             )
 
         # ----------------------------------------------------
-        # RESET
+        # ОЧИЩАЕМ СОСТОЯНИЕ
         # ----------------------------------------------------
 
-        reset_state(user_id)
+        reset_state(
+            user_id
+        )
 
-    except Exception as e:
+    except Exception as error:
 
         logger.exception(
-            "process_current_product error: %s",
-            e,
+            "PROCESS ERROR: %s",
+            error
         )
+
+        state["processing"] = False
 
         await context.bot.send_message(
+
             chat_id=chat_id,
+
             text=(
-                "⚠️ Что-то пошло не так при обработке товара.\n\n"
-                "Попробуй отправить фото ещё раз."
-            ),
+                "⚠️ Произошла ошибка при обработке "
+                "товара.\n\n"
+                "Попробуй отправить фотографию ещё раз."
+            )
+
         )
 
-        reset_state(user_id)
-
 
 # ============================================================
-# DEBOUNCE
+# DELAYED PROCESSING
 # ============================================================
 
-def schedule_product_processing(
+def schedule_processing(
     user_id: int,
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
-    delay: float = PHOTO_WAIT_SECONDS,
+    delay: float = 1.5
 ):
 
-    old_task = PROCESS_TASKS.get(user_id)
+    old_task = (
+        PROCESS_TASKS.get(
+            user_id
+        )
+    )
 
     if old_task and not old_task.done():
+
         old_task.cancel()
 
     async def delayed():
+
         try:
-            await asyncio.sleep(delay)
 
-            state = get_state(user_id)
+            await asyncio.sleep(
+                delay
+            )
 
-            # Если за это время ничего не пришло — обрабатываем.
-            await process_current_product(
+            await process_product(
                 user_id,
                 chat_id,
-                context,
+                context
             )
 
         except asyncio.CancelledError:
+
             pass
 
         except Exception:
+
             logger.exception(
-                "Delayed product processing error"
+                "DELAYED ERROR"
             )
 
-    task = asyncio.create_task(delayed())
-
-    PROCESS_TASKS[user_id] = task
+    PROCESS_TASKS[user_id] = (
+        asyncio.create_task(
+            delayed()
+        )
+    )
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
-async def start_command(
+async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    user_id = update.effective_user.id
+    user_id = (
+        update.effective_user.id
+    )
 
-    reset_state(user_id)
+    reset_state(
+        user_id
+    )
 
     await update.message.reply_text(
+
         "Привет! 💕\n\n"
+
         "Я помогу подготовить карточку товара.\n\n"
-        "Просто отправь мне:\n\n"
-        "📷 фото товара\n"
-        "💰 цену\n"
-        "📦 количество, если оно больше 1\n\n"
-        "Например:\n"
-        "«3500 ₽, в наличии 2 шт.»\n\n"
-        "Можно написать цену прямо в подписи к фотографии "
-        "или следующим сообщением — я пойму оба варианта."
-    )
 
+        "Просто отправь мне фотографию товара "
+        "и цену.\n\n"
 
-# ============================================================
-# HELP
-# ============================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-        "Как работать со мной:\n\n"
-        "📷 Отправь фото товара.\n"
-        "💰 Напиши цену.\n"
-        "📦 При необходимости укажи количество.\n\n"
-        "Можно сделать так:\n"
-        "Фото + подпись «3500 ₽, в наличии 2 шт.»\n\n"
-        "Или:\n"
-        "Фото\n"
+        "Можно прямо так:\n"
+        "📷 фото\n"
         "3500 ₽\n\n"
-        "Я сама распознаю товар, определю категорию "
-        "и подготовлю карточку."
+
+        "Или ещё удобнее:\n"
+        "📷 фото с подписью "
+        "«3500 ₽, в наличии 2 шт.»\n\n"
+
+        "Я определю бренд, название, категорию "
+        "и подготовлю карточку для твоего канала."
     )
 
 
 # ============================================================
-# PHOTO HANDLER
+# PHOTO
 # ============================================================
 
 async def photo_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.message or not update.message.photo:
+    if not update.message:
         return
 
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+    if not update.message.photo:
+        return
 
-    state = get_state(user_id)
+    user_id = (
+        update.effective_user.id
+    )
 
-    # Самая большая фотография.
-    photo = update.message.photo[-1]
+    chat_id = (
+        update.effective_chat.id
+    )
 
-    state["photos"].append(photo.file_id)
+    state = get_state(
+        user_id
+    )
 
-    state["last_activity"] = time.time()
+    # Берём самое большое фото.
+    photo = (
+        update.message.photo[-1]
+    )
+
+    state["photos"].append(
+        photo.file_id
+    )
 
     # --------------------------------------------------------
-    # ТЕКСТ ПОД ФОТО
+    # ПОДПИСЬ К ФОТО
     # --------------------------------------------------------
 
     caption = (
@@ -1181,54 +1278,59 @@ async def photo_handler(
     ).strip()
 
     if caption:
-        state["photo_captions"].append(caption)
-        state["text_parts"].append(caption)
 
-        parsed_price = parse_price(caption)
+        state["texts"].append(
+            caption
+        )
 
-        if parsed_price is not None:
-            state["price"] = parsed_price
+        price = parse_price(
+            caption
+        )
 
-        parsed_stock = parse_stock(caption)
+        if price is not None:
+            state["price"] = price
 
-        if parsed_stock is not None:
-            state["stock"] = parsed_stock
+        stock = parse_stock(
+            caption
+        )
+
+        if stock is not None:
+            state["stock"] = stock
 
     # --------------------------------------------------------
-    # ЕСЛИ ПРИШЛА ВТОРАЯ ФОТОГРАФИЯ
+    # ВТОРАЯ ФОТОГРАФИЯ
     # --------------------------------------------------------
 
     if len(state["photos"]) >= 2:
 
-        # Не надо ждать ещё долго.
-        schedule_product_processing(
-            user_id=user_id,
-            chat_id=chat_id,
-            context=context,
-            delay=0.5,
+        schedule_processing(
+            user_id,
+            chat_id,
+            context,
+            delay=0.4
         )
 
         return
 
     # --------------------------------------------------------
-    # ЖДЁМ ЦЕНУ / ВТОРУЮ ФОТОГРАФИЮ
+    # ПЕРВАЯ ФОТОГРАФИЯ
     # --------------------------------------------------------
 
-    schedule_product_processing(
-        user_id=user_id,
-        chat_id=chat_id,
-        context=context,
-        delay=PHOTO_WAIT_SECONDS,
+    schedule_processing(
+        user_id,
+        chat_id,
+        context,
+        delay=1.5
     )
 
 
 # ============================================================
-# TEXT HANDLER
+# TEXT
 # ============================================================
 
 async def text_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     if not update.message:
@@ -1242,118 +1344,139 @@ async def text_handler(
     if not text:
         return
 
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+    user_id = (
+        update.effective_user.id
+    )
 
-    state = get_state(user_id)
+    chat_id = (
+        update.effective_chat.id
+    )
+
+    state = get_state(
+        user_id
+    )
 
     # --------------------------------------------------------
-    # ЕСЛИ ЖДЁМ ЦЕНУ
+    # ЦЕНА
     # --------------------------------------------------------
 
-    parsed_price = parse_price(text)
-    parsed_stock = parse_stock(text)
+    price = parse_price(
+        text
+    )
 
-    # Если пользователь прислал цену.
-    if parsed_price is not None:
+    stock = parse_stock(
+        text
+    )
 
-        state["price"] = parsed_price
+    if price is not None:
 
-        if parsed_stock is not None:
-            state["stock"] = parsed_stock
+        state["price"] = price
 
-        state["text_parts"].append(text)
-        state["last_activity"] = time.time()
+        if stock is not None:
+            state["stock"] = stock
 
-        # Если фото уже есть — запускаем обработку.
+        state["texts"].append(
+            text
+        )
+
+        # Если фото уже есть,
+        # обрабатываем практически сразу.
         if state["photos"]:
 
-            schedule_product_processing(
-                user_id=user_id,
-                chat_id=chat_id,
-                context=context,
-                delay=0.4,
+            schedule_processing(
+                user_id,
+                chat_id,
+                context,
+                delay=0.3
             )
 
             return
 
     # --------------------------------------------------------
-    # ЕСЛИ ПРИСЛАЛИ ТОЛЬКО КОЛИЧЕСТВО
+    # ТОЛЬКО КОЛИЧЕСТВО
     # --------------------------------------------------------
 
-    if parsed_stock is not None:
+    if stock is not None:
 
-        state["stock"] = parsed_stock
-        state["text_parts"].append(text)
-        state["last_activity"] = time.time()
+        state["stock"] = stock
+
+        state["texts"].append(
+            text
+        )
 
         if state["photos"]:
 
-            schedule_product_processing(
-                user_id=user_id,
-                chat_id=chat_id,
-                context=context,
-                delay=0.4,
+            schedule_processing(
+                user_id,
+                chat_id,
+                context,
+                delay=0.3
             )
 
             return
 
     # --------------------------------------------------------
-    # ЕСЛИ ЭТО ОБЫЧНЫЙ ТЕКСТ ПОСЛЕ ФОТО
+    # ТЕКСТ ПОСЛЕ ФОТО
     # --------------------------------------------------------
 
     if state["photos"]:
 
-        state["text_parts"].append(text)
-        state["last_activity"] = time.time()
+        state["texts"].append(
+            text
+        )
 
-        # Цена могла быть написана нестандартно.
-        # Например: "моя цена 3500"
-        if "цена" in text.lower():
+        # Иногда человек пишет:
+        # "моя цена 3500"
+        if state["price"] is None:
 
             numbers = re.findall(
-                r"\b\d{3,6}\b",
-                text.replace(" ", ""),
+                r"\d{3,6}",
+                text.replace(
+                    " ",
+                    ""
+                )
             )
 
             if numbers:
-                try:
-                    value = int(numbers[-1])
 
-                    if 100 <= value <= 999999:
-                        state["price"] = value
+                try:
+
+                    possible_price = int(
+                        numbers[-1]
+                    )
+
+                    if (
+                        100
+                        <= possible_price
+                        <= 999999
+                    ):
+
+                        state["price"] = (
+                            possible_price
+                        )
+
                 except ValueError:
                     pass
 
-        if state.get("price") is not None:
+        if state["price"] is not None:
 
-            schedule_product_processing(
-                user_id=user_id,
-                chat_id=chat_id,
-                context=context,
-                delay=0.5,
+            schedule_processing(
+                user_id,
+                chat_id,
+                context,
+                delay=0.3
             )
-
-            return
-
-        # Если цена пока не найдена — ждём немного.
-        schedule_product_processing(
-            user_id=user_id,
-            chat_id=chat_id,
-            context=context,
-            delay=PHOTO_WAIT_SECONDS,
-        )
 
         return
 
     # --------------------------------------------------------
-    # ТЕКСТ БЕЗ ФОТО
+    # БЕЗ ФОТО
     # --------------------------------------------------------
 
     await update.message.reply_text(
-        "📷 Сначала отправь мне фотографию товара.\n\n"
-        "Цену можешь написать прямо в подписи к фото "
-        "или следующим сообщением."
+
+        "📷 Сначала пришли фотографию товара.\n\n"
+        "Цену можно написать сразу после фото."
     )
 
 
@@ -1363,22 +1486,32 @@ async def text_handler(
 
 async def callback_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    query = update.callback_query
-
-    if not query:
-        return
+    query = (
+        update.callback_query
+    )
 
     await query.answer()
 
-    data = query.data or ""
+    data = (
+        query.data
+        or ""
+    )
 
     try:
-        action, raw_id = data.split(":", 1)
-        product_id = int(raw_id)
+
+        action, raw_id = (
+            data.split(":", 1)
+        )
+
+        product_id = int(
+            raw_id
+        )
+
     except Exception:
+
         return
 
     # --------------------------------------------------------
@@ -1387,65 +1520,66 @@ async def callback_handler(
 
     if action == "approve":
 
-        conn = db_connect()
+        connection = db()
 
-        product = conn.execute(
-            "SELECT * FROM products WHERE id = ?",
-            (product_id,),
-        ).fetchone()
-
-        if product:
-            conn.execute(
-                """
-                UPDATE products
-                SET status = 'approved'
-                WHERE id = ?
-                """,
-                (product_id,),
-            )
-
-            conn.commit()
-
-        conn.close()
-
-        await query.edit_message_reply_markup(
-            reply_markup=None
+        connection.execute(
+            """
+            UPDATE products
+            SET status = 'approved'
+            WHERE id = ?
+            """,
+            (product_id,)
         )
 
+        connection.commit()
+        connection.close()
+
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=None
+            )
+        except Exception:
+            pass
+
         await query.message.reply_text(
-            "✅ Товар одобрен.\n\n"
-            "Теперь его можно поставить в очередь "
-            "на публикацию."
+
+            "✅ Товар одобрен!\n\n"
+            "Он сохранён как готовый товар. "
+            "Публикацию можно будет поставить "
+            "в очередь."
         )
 
         return
 
     # --------------------------------------------------------
-    # CANCEL
+    # DELETE
     # --------------------------------------------------------
 
-    if action == "cancel":
+    if action == "delete":
 
-        conn = db_connect()
+        connection = db()
 
-        conn.execute(
+        connection.execute(
             """
             UPDATE products
             SET status = 'deleted'
             WHERE id = ?
             """,
-            (product_id,),
+            (product_id,)
         )
 
-        conn.commit()
-        conn.close()
+        connection.commit()
+        connection.close()
 
-        await query.edit_message_reply_markup(
-            reply_markup=None
-        )
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=None
+            )
+        except Exception:
+            pass
 
         await query.message.reply_text(
-            "🗑 Товар удалён из черновиков."
+            "🗑 Товар удалён."
         )
 
         return
@@ -1457,158 +1591,55 @@ async def callback_handler(
     if action == "edit":
 
         await query.message.reply_text(
-            "✏️ Напиши, что именно изменить.\n\n"
+
+            "✏️ Напиши, что изменить.\n\n"
+
             "Например:\n"
-            "«Поменяй цену на 4200»\n"
-            "«Название должно быть ...»\n"
-            "«В наличии 3 шт.»"
+            "«Поставь цену 4500 ₽»\n"
+            "«В наличии 3 шт.»\n"
+            "«Название — ...»"
         )
 
         return
 
     # --------------------------------------------------------
-    # OTHER PHOTO
+    # PHOTO
     # --------------------------------------------------------
 
     if action == "photo":
 
         await query.message.reply_text(
-            "🖼 Пришли новое фото товара.\n\n"
-            "Я использую его вместо текущего."
+
+            "🖼 Хорошо!\n\n"
+            "Пришли новое фото товара."
         )
 
         return
 
 
 # ============================================================
-# SCHEDULING
+# HELP
 # ============================================================
 
-def get_user_settings(user_id: int):
-
-    conn = db_connect()
-
-    row = conn.execute(
-        """
-        SELECT *
-        FROM settings
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    ).fetchone()
-
-    if not row:
-
-        conn.execute(
-            """
-            INSERT INTO settings (
-                user_id,
-                posts_per_day,
-                times,
-                days,
-                timezone,
-                paused
-            )
-            VALUES (?, 1, '12:00', '0,1,2,3,4,5,6',
-                    'Europe/Moscow', 0)
-            """,
-            (user_id,),
-        )
-
-        conn.commit()
-
-        row = conn.execute(
-            """
-            SELECT *
-            FROM settings
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ).fetchone()
-
-    conn.close()
-
-    return row
-
-
-async def schedule_command(
+async def help_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    user_id = update.effective_user.id
-
-    settings = get_user_settings(user_id)
-
     await update.message.reply_text(
-        "📅 Настройки публикаций\n\n"
-        f"Постов в день: {settings['posts_per_day']}\n"
-        f"Время: {settings['times']}\n"
-        f"Дни недели: {settings['days']}\n"
-        f"Часовой пояс: {settings['timezone']}\n\n"
-        "Для изменения настроек позже можно будет "
-        "использовать отдельное меню."
-    )
 
+        "Как пользоваться ботом:\n\n"
 
-# ============================================================
-# QUEUE
-# ============================================================
+        "📷 Отправь фото.\n"
+        "💰 Напиши цену.\n"
+        "📦 При необходимости напиши количество.\n\n"
 
-async def queue_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+        "Можно одним сообщением:\n"
+        "фото + «3500 ₽, в наличии 2 шт.»\n\n"
 
-    user_id = update.effective_user.id
-
-    conn = db_connect()
-
-    rows = conn.execute(
-        """
-        SELECT
-            q.id,
-            q.publish_at,
-            p.name,
-            p.brand
-        FROM queue q
-        LEFT JOIN products p
-            ON p.id = q.product_id
-        WHERE q.user_id = ?
-          AND q.status = 'scheduled'
-        ORDER BY q.publish_at
-        LIMIT 20
-        """,
-        (user_id,),
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-        await update.message.reply_text(
-            "📭 Очередь публикаций пока пустая."
-        )
-        return
-
-    lines = ["📅 Очередь публикаций:\n"]
-
-    for row in rows:
-
-        title = " ".join(
-            x for x in [
-                row["brand"],
-                row["name"],
-            ]
-            if x
-        )
-
-        lines.append(
-            f"• {row['publish_at']}\n"
-            f"  {title or 'Товар'}"
-        )
-
-    await update.message.reply_text(
-        "\n\n".join(lines)
+        "Или двумя:\n"
+        "фото\n"
+        "3500 ₽"
     )
 
 
@@ -1616,179 +1647,159 @@ async def queue_command(
 # MENU
 # ============================================================
 
-async def setup_menu(application: Application):
+async def set_menu(
+    application
+):
 
     commands = [
+
         ("start", "Начать"),
+
         ("help", "Помощь"),
-        ("queue", "Очередь публикаций"),
-        ("schedule", "Настройки публикаций"),
+
     ]
 
-    await application.bot.set_my_commands(commands)
+    await application.bot.set_my_commands(
+        commands
+    )
 
     try:
+
         await application.bot.set_chat_menu_button(
             menu_button=MenuButtonCommands()
         )
-    except Exception as e:
+
+    except Exception as error:
+
         logger.warning(
-            "Could not set menu button: %s",
-            e,
+            "Menu error: %s",
+            error
         )
 
 
 # ============================================================
-# ERROR HANDLER
+# ERROR
 # ============================================================
 
 async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
+    update,
+    context
 ):
 
     logger.exception(
-        "Unhandled Telegram error: %s",
-        context.error,
+        "Telegram error: %s",
+        context.error
     )
 
 
 # ============================================================
-# TELEGRAM APPLICATION
+# TELEGRAM
 # ============================================================
 
-telegram_application: Optional[Application] = None
+telegram_app = None
 
 
-async def start_bot():
+async def run_bot():
 
-    global telegram_application
+    global telegram_app
 
     init_database()
 
-    telegram_application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
+    telegram_app = (
+        Application
+        .builder()
+        .token(
+            TELEGRAM_BOT_TOKEN
+        )
         .build()
     )
 
-    telegram_application.add_handler(
-        CommandHandler("start", start_command)
+    telegram_app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
-    telegram_application.add_handler(
-        CommandHandler("help", help_command)
+    telegram_app.add_handler(
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
 
-    telegram_application.add_handler(
-        CommandHandler("queue", queue_command)
+    telegram_app.add_handler(
+        CallbackQueryHandler(
+            callback_handler
+        )
     )
 
-    telegram_application.add_handler(
-        CommandHandler("schedule", schedule_command)
-    )
-
-    telegram_application.add_handler(
-        CallbackQueryHandler(callback_handler)
-    )
-
-    telegram_application.add_handler(
+    telegram_app.add_handler(
         MessageHandler(
             filters.PHOTO,
-            photo_handler,
+            photo_handler
         )
     )
 
-    telegram_application.add_handler(
+    telegram_app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_handler,
+            filters.TEXT
+            & ~filters.COMMAND,
+            text_handler
         )
     )
 
-    telegram_application.add_error_handler(
+    telegram_app.add_error_handler(
         error_handler
     )
 
-    await telegram_application.initialize()
+    await telegram_app.initialize()
 
-    await telegram_application.start()
+    await telegram_app.start()
 
-    await telegram_application.updater.start_polling(
+    await telegram_app.updater.start_polling(
         drop_pending_updates=True
     )
 
-    await setup_menu(telegram_application)
+    await set_menu(
+        telegram_app
+    )
 
-    logger.info("Telegram bot started")
+    logger.info(
+        "BOT STARTED SUCCESSFULLY"
+    )
 
     while True:
-        await asyncio.sleep(3600)
 
-
-async def stop_bot():
-
-    global telegram_application
-
-    if telegram_application:
-
-        try:
-            await telegram_application.updater.stop()
-        except Exception:
-            pass
-
-        try:
-            await telegram_application.stop()
-        except Exception:
-            pass
-
-        try:
-            await telegram_application.shutdown()
-        except Exception:
-            pass
+        await asyncio.sleep(
+            3600
+        )
 
 
 # ============================================================
-# FASTAPI
+# FASTAPI STARTUP
 # ============================================================
+
+@app.on_event("startup")
+async def startup():
+
+    asyncio.create_task(
+        run_bot()
+    )
+
 
 @app.get("/")
 async def root():
+
     return {
         "status": "ok",
-        "service": "beauty-manager-bot",
+        "bot": "running"
     }
 
 
 @app.get("/health")
 async def health():
+
     return {
-        "status": "healthy",
-        "bot": bool(telegram_application),
+        "status": "healthy"
     }
-
-
-# ============================================================
-# RENDER STARTUP
-# ============================================================
-
-@app.on_event("startup")
-async def startup_event():
-
-    asyncio.create_task(
-        start_bot()
-    )
-
-    logger.info(
-        "Beauty Manager started"
-    )
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-
-    await stop_bot()
-
-    logger.info(
-        "Beauty Manager stopped"
-)
